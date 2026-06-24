@@ -286,11 +286,25 @@ def save_style(path, style_ttl, style_dp, source_file=None):
 def main():
     _patch_onnx2torch()
 
-    arg = sys.argv[1] if len(sys.argv) > 1 else "configs/caelus.json"
-    with open(arg, "r", encoding="utf-8") as f:
+    # ── 인자 파싱 및 Config 경로 탐색 로직 복구 ──────────────────────────────
+    arg = sys.argv[1] if len(sys.argv) > 1 else "caelus"
+    
+    if os.path.exists(arg):
+        config_path = arg
+    elif os.path.exists(f"configs/{arg}.json"):
+        config_path = f"configs/{arg}.json"
+    elif os.path.exists(f"configs/{arg}"):
+        config_path = f"configs/{arg}"
+    else:
+        config_path = f"configs/{arg}.json"  # 파일 미존재 예외 발생용 폴백
+
+    print(f"Loading config: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
     name = cfg["name"]
+    # ─────────────────────────────────────────────────────────────────────────
+    
     target_wav_paths = list(cfg["target_wavs"]) if "target_wavs" in cfg else [cfg["target_wav"]]
     
     # Stochastic mode replacing rotate
