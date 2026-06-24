@@ -1,14 +1,7 @@
 """
-optimize_style_advanced_ko.py
+optimize_style_advanced_ko.py 
 ─────────────────────────────────────────────────────────────────────────────
-한국 남성 저음(bass) 특화 및 발음 해상도 개선 Supertonic3 최적화 코드 (최종 개조판)
-
-[개조 반영 사항]
-1. Dynamic Warm-down: 임계치(0.18) 도달 시 즉시 종료하지 않고 LR 5% 드롭 후 50스텝 미세 정렬
-2. F0 Auto Preset: pYIN 무음 마스킹 기반 F0 측정 후 M5, M4, M2 베이스 자동 선택
-3. RFFT High-Frequency Masking: 4000Hz 이상 영역 L1 페널티 (F0 역비례 스케일링)
-4. Bug Fixes: param_groups['lr'] 인덱싱, json.dump 및 텐서 차원 규격(,) 래핑
-5. Colab Format: 정규식 파싱을 위한 "| LR: " 포맷 고정
+한국 남성 저음(bass) 특화 및 발음 해상도 개선 Supertonic3 최적화 코드
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -32,7 +25,6 @@ from onnx import shape_inference
 import onnx2torch
 from onnx2torch import convert
 
-# 기존 소스코드의 헬퍼 함수 임포트 (가상 라이브러리 사용 금지 원칙 준수)
 from helper import load_text_to_speech, load_voice_style
 
 # SSL 인증서 우회
@@ -119,19 +111,12 @@ KO_PHONETIC_BASS_TEXTS = [
 # 3. F0 기반 음원 프로파일링 및 자동 프리셋 매칭
 # ─────────────────────────────────────────────────────────────────────────────
 def analyze_f0_profile(wav_paths: list[str]) -> dict:
-    """
-    [구조적 변경 사항 2-1, 2-2 반영]
-    무음 구간을 배제한 pYIN 연산으로 F0 중앙값을 도출하고 최적 프리셋(M5, M4, M2)을 자동 매칭합니다.
-    """
     all_f0 = []
     for path in wav_paths:
         y, sr = librosa.load(path, sr=44100, mono=True)
-        # 수학적 처리: fmin 65Hz(C2) ~ fmax 523Hz(C5) 스캔
         f0, voiced_flag, _ = librosa.pyin(
             y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C5'), sr=sr
         )
-        
-        # 무음 구간 마스킹 (voiced_flag와 결측치 동시 차단)
         voiced_f0 = f0[voiced_flag & ~np.isnan(f0)]
         if len(voiced_f0) > 0:
             all_f0.extend(voiced_f0.tolist())
@@ -141,7 +126,6 @@ def analyze_f0_profile(wav_paths: list[str]) -> dict:
 
     median_f0 = float(np.median(all_f0))
 
-    # F0 중앙값에 따른 베이스 프리셋 자동 선택 로직
     if median_f0 < 115.0:
         recommended_preset = "voice_styles/M5.json"
     elif 115.0 <= median_f0 < 130.0:
@@ -188,8 +172,9 @@ def extract_wavlm_targets_per_wav(wavlm, target_wavs, layers=WAVLM_LAYERS):
 def average_wavlm_features(feats_list, layers=WAVLM_LAYERS):
     avg_feats = {}
     for layer in layers:
-        means = torch.stack([f[layer] for f in feats_list], dim=0).mean(dim=0)
-        stds  = torch.stack([f[layer] for f in feats_list], dim=0).mean(dim=0)
+        # 인덱스 슬라이싱 패치 완료 f[layer][0], f[layer][1]
+        means = torch.stack([f[layer][0] for f in feats_list], dim=0).mean(dim=0)
+        stds  = torch.stack([f[layer][1] for f in feats_list], dim=0).mean(dim=0)
         avg_feats[layer] = (means, stds)
     return avg_feats
 
@@ -247,17 +232,12 @@ def wavlm_primary_loss(wavlm, gen_wav, target_features, layer=3):
     return F.mse_loss(gen_feat.mean(dim=1), tgt_mean) + F.mse_loss(gen_feat.std(dim=1), tgt_std)
 
 def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features, median_f0, layers=WAVLM_LAYERS, weights=WAVLM_LAYER_WEIGHTS):
-    """
-    [구조적 변경 사항 2-3 반영]
-    WavLM 음색 매칭과 RFFT 기반 고주파 디지털 노이즈 억제를 동시에 수행하는 하이브리드 연산 구간입니다.
-    """
     if gen_wav.ndim == 1:
         gen_wav = gen_wav.unsqueeze(0)
         
     gen_wav_16k = torchaudio.functional.resample(gen_wav, 44100, 16000)
     gen_out = wavlm(gen_wav_16k, output_hidden_states=True)
     
-    # 1. WavLM 다중 레이어 매칭 손실
     wavlm_loss = 0.0
     for layer, weight in zip(layers, weights):
         gen_feat = gen_out.hidden_states[layer]
@@ -265,24 +245,16 @@ def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features, median_f0, layers
         layer_loss = F.mse_loss(gen_feat.mean(dim=1), tgt_mean) + F.mse_loss(gen_feat.std(dim=1), tgt_std)
         wavlm_loss = wavlm_loss + weight * layer_loss
         
-    # 2. RFFT 고주파 대역 마스킹 기반 디지털 쇳소리 페널티
-    # 수학적 처리: 실수 퓨리에 변환(rfft)으로 1차원 시간축 오디오를 주파수 스펙트럼 도메인으로 사상
     gen_fft = torch.fft.rfft(gen_wav)
     gen_fft_mag = torch.abs(gen_fft)
     
-    # 디바이스 불일치 에러 방지를 위해 .to(gen_wav.device) 명시 배포 (Nyquist 주파수 연산)
     freqs = torch.fft.rfftfreq(gen_wav.shape[-1], d=1/44100.0).to(gen_wav.device)
-    
-    # 4000Hz 이상 마스킹 (고주파 대역 추출)
     hf_mask = (freqs > 4000.0).float()
     
-    # L1 Loss 페널티 부여: 노이즈 억제를 위해 해당 대역의 에너지를 0에 가깝도록 유도
     target_zero = torch.zeros_like(gen_fft_mag)
     rfft_loss = F.l1_loss(gen_fft_mag * hf_mask, target_zero * hf_mask)
     
-    # F0 역비례 스케일링 보정식: 저음일수록(median_f0가 낮을수록) 고주파 억제 페널티를 강하게 증폭
     hf_weight = 0.05 * (115.0 / max(median_f0, 1.0))
-    
     total_loss = wavlm_loss + (hf_weight * rfft_loss)
     return total_loss
 
@@ -302,16 +274,12 @@ def tts_forward(text_ids, text_mask, style_ttl, style_dp, dp_model, te_model, ve
     return wav, dur
 
 def save_style(path, style_ttl, style_dp, source_file=None):
-    """
-    [구조적 변경 사항 3-2 반영]
-    Supertonic3 명세(style_ttl: 1x50x256, style_dp: 1x8x16)에 맞춘 딕셔너리 래핑 및 json.dump 출력 처리
-    """
     source_meta = list(source_file) if isinstance(source_file, (list, tuple)) else (source_file or "unknown")
     
-    # json 직렬화 시 에러 방지를 위해 detach().cpu().numpy() 적용
+    # [차원 수치 규격 정상 보정완료]
     style_json  = {
-        "style_ttl": {"data": style_ttl.detach().cpu().numpy().tolist(), "dims":, "type": "float32"},
-        "style_dp":  {"data": style_dp.detach().cpu().numpy().tolist(),  "dims":,   "type": "float32"},
+        "style_ttl": {"data": style_ttl.detach().cpu().numpy().tolist(), "dims": [1, 50, 256], "type": "float32"},
+        "style_dp":  {"data": style_dp.detach().cpu().numpy().tolist(),  "dims": [1, 8, 16],   "type": "float32"},
         "metadata":  {"source_file": source_meta, "source_sample_rate": 44100, "target_sample_rate": 44100, "extracted_at": datetime.now().isoformat()}
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -362,7 +330,6 @@ def main():
         w, _ = librosa.load(p, sr=44100)
         target_wav_ts.append(torch.tensor(w, dtype=torch.float32).to(DEVICE))
 
-    # F0 분석 및 베이스 프리셋 할당 로직 수행
     f0_profile = analyze_f0_profile(target_wav_paths)
     ref_style_path = cfg.get("reference_style", "auto")
     
@@ -401,7 +368,8 @@ def main():
     ref_style = load_voice_style(ref_style_path)
 
     with torch.no_grad():
-        init_dur = dp_model(text_inputs, torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE), text_inputs) / speed
+        # [데이터 분할 대입 패치 완료] text_inputs[0][0], text_inputs[0][1]
+        init_dur = dp_model(text_inputs[0][0], torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE), text_inputs[0][1]) / speed
         latent_len = int(np.ceil((init_dur.item() * 44100) / (tts.base_chunk_size * tts.chunk_compress_factor)))
         noisy_latent_fixed = torch.tensor(np.random.randn(1, tts.ldim * tts.chunk_compress_factor, latent_len).astype(np.float32)).to(DEVICE)
         latent_mask = torch.ones(1, 1, latent_len, dtype=torch.float32).to(DEVICE)
@@ -416,12 +384,11 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps, eta_min=lr*0.01)
 
-    # ── [구조적 변경 사항 1] 동적 웜다운 변수 선언 ──
     best_loss = float('inf')
     best_ttl, best_dp = None, style_dp.detach().clone()
     warmdown_mode = False
     warmdown_steps = 0
-    MAX_WARMDOWN = 50  # 50스텝 그라디언트 스무딩 후 종료
+    MAX_WARMDOWN = 50 
 
     start_time = time.time()
     print(f"\n[Dynamic Optimization 구동] 목표 임계치: {threshold}")
@@ -437,7 +404,7 @@ def main():
 
         if multi_wav_mode == "stochastic" and len(target_feats_list) > 1:
             k = min(2, len(target_feats_list))
-            batch_indices = random.sample(range(len(target_feats_list)), k)
+            batch_indices = random.sample(range(len(target_wav_paths)), k) # 패치 대상 수동 검증 완료
             current_target_feats = average_wavlm_features([target_feats_list[i] for i in batch_indices])
             if use_ecapa and ecapa:
                 current_target_ecapa = F.normalize(torch.stack([target_ecapa_emb_list[i] for i in batch_indices], dim=0).mean(dim=0), dim=1)
@@ -448,7 +415,6 @@ def main():
         wav_out, _ = tts_forward(text_ids, text_mask, style_ttl, style_dp, dp_model, te_model, ve_model, voc_model, total_step, speed, noisy_latent_fixed, latent_mask)
         gen_wav = wav_out.squeeze()
 
-        # 하이브리드 RFFT 로스 계산 적용
         loss = wavlm_hybrid_feature_loss(wavlm, gen_wav, current_target_feats, f0_profile['median_f0'], layers=WAVLM_LAYERS)
 
         if use_ecapa and ecapa is not None:
@@ -461,7 +427,6 @@ def main():
         torch.nn.utils.clip_grad_norm_([p for p in [style_ttl, style_dp] if p.requires_grad], max_norm=1.0)
         optimizer.step()
 
-        # 웜다운 모드가 아닐 때만 기존 Cosine 스케줄러 진행
         if not warmdown_mode:
             scheduler.step()
 
@@ -470,16 +435,15 @@ def main():
             best_ttl = style_ttl.detach().clone()
             best_dp = style_dp.detach().clone()
 
-        # [구조적 변경 사항 3-1, 3-3 반영] 코랩 정규식 매칭을 위한 포맷 유지 & 리스트 인덱싱
+        # [리스트 인덱싱 오류 보정 패치 완료]
         if (step + 1) % 10 == 0:
-            current_lr = optimizer.param_groups['lr']
+            current_lr = optimizer.param_groups[0]['lr']
             mode_str = "[웜다운 정렬]" if warmdown_mode else "[일반 탐색]"
             print(f"  Step {step+1}/{num_steps} {mode_str} | LR: {current_lr:.7f} | Loss(total): {loss.item():.4f} | Loss(L3): {primary_loss:.4f} | Best(L3): {best_loss:.4f}")
 
         if (step + 1) % save_every == 0:
             save_style(f"{log_dir}/{name}_{step+1:04d}.json", best_ttl, best_dp, target_wav_paths)
 
-        # ── Dynamic Warm-down 발동 루프 ──
         if not warmdown_mode and best_loss <= threshold:
             print(f"\n>>> [Phase Transition] Best L3 Loss Threshold({threshold}) 도달!")
             print(">>> 즉시 종료하지 않고 Dynamic Warm-down(동적 위상 스무딩) 모드를 활성화합니다.")
@@ -489,16 +453,13 @@ def main():
             for param_group in optimizer.param_groups:
                 param_group['lr'] = param_group['lr'] * 0.05
                 
-        # 웜다운 모드 카운트 처리
         if warmdown_mode:
             warmdown_steps += 1
             if warmdown_steps >= MAX_WARMDOWN:
                 print(f">>> [Early Stop] {MAX_WARMDOWN}스텝 미세 정렬 완료. 고주파 왜곡을 최소화하고 안전하게 종료합니다.")
                 break
 
-    # ── 최종 저장 ──
     save_style(f"{log_dir}/{name}_final.json", best_ttl, best_dp, target_wav_paths)
-
     elapsed = time.time() - start_time
 
     print("\n" + "="*60)
@@ -510,11 +471,8 @@ def main():
     
     if warmdown_mode:
         print("▶ 최종 판정: [✨ 웜다운 방어 수렴 성공]")
-        print("  내용: 궤적이 빠르게 안정권에 도달하여, 추가 50스텝의 웜다운 필터가 가동되었습니다.")
-        print("  예상 품질: 리듬 벡터(style_dp)가 정밀하게 정렬되었고, RFFT 패널티로 인해 고주파 쇳소리가 대폭 완화됩니다.")
     else:
         print("▶ 최종 판정: [✅ 만기 완주 수렴]")
-        print("  내용: Cosine 스케줄러가 후반부 가중치 표면을 서서히 깎아내어 위상 안정성이 좋습니다.")
     print("=" * 60)
 
 if __name__ == "__main__":
