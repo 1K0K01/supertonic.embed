@@ -388,6 +388,7 @@ def main():
     warmdown_steps = 0
     MAX_WARMDOWN = 50 
 
+    initial_gap = None
     start_time = time.time()
     print(f"\n[Dynamic Optimization 구동] 목표 임계치: {threshold}")
 
@@ -433,10 +434,29 @@ def main():
             best_ttl = style_ttl.detach().clone()
             best_dp = style_dp.detach().clone()
 
+                # ── [로그 파싱 및 프로그레스 바 매칭 규격 복구] ──
         if (step + 1) % 10 == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            mode_str = "[웜다운 정렬]" if warmdown_mode else "[일반 탐색]"
-            print(f"  Step {step+1}/{num_steps} {mode_str} | LR: {current_lr:.7f} | Loss(total): {loss.item():.4f} | Loss(L3): {primary_loss:.4f} | Best(L3): {best_loss:.4f}")
+            
+            # 파싱 엔진 전용 고정 포맷 스트림 출력 (순서/공백 절대 유지)
+            print(f"  Step {step+1}/{num_steps} | Loss(total): {loss.item():.4f} | Loss(L3): {primary_loss:.4f} | LR: {current_lr:.5f} | Best(L3): {best_loss:.4f}")
+            
+            # 초기 오차 마진 수렴도 계산
+            if initial_gap is None:
+                initial_gap = max(0.001, best_loss - threshold)
+            
+            current_gap = max(0.0, best_loss - threshold)
+            if current_gap == 0:
+                percentage = 100.0
+            else:
+                percentage = max(0.0, (1.0 - (current_gap / initial_gap)) * 100.0)
+            
+            # 20칸 기준 프로그레스 바 문자열 생성 (5%당 1칸)
+            num_blocks = min(20, max(0, int(percentage / 5)))
+            bar_str = "█" * num_blocks + "-" * (20 - num_blocks)
+            
+            # 서브스트림 라인 출력
+            print(f"    [{bar_str}]  {percentage:.1f}%  (best {best_loss:.4f} -> 목표 {threshold:.4f}, gap +{current_gap:.4f})")
 
         if (step + 1) % save_every == 0:
             save_style(f"{log_dir}/{name}_{step+1:04d}.json", best_ttl, best_dp, target_wav_paths)
