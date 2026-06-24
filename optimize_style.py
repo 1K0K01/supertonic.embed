@@ -1,5 +1,5 @@
 """
-optimize_style_advanced_ko.py 
+optimize_style_advanced_ko.py (최종 무결성 패치판)
 ─────────────────────────────────────────────────────────────────────────────
 한국 남성 저음(bass) 특화 및 발음 해상도 개선 Supertonic3 최적화 코드
 ─────────────────────────────────────────────────────────────────────────────
@@ -172,7 +172,6 @@ def extract_wavlm_targets_per_wav(wavlm, target_wavs, layers=WAVLM_LAYERS):
 def average_wavlm_features(feats_list, layers=WAVLM_LAYERS):
     avg_feats = {}
     for layer in layers:
-        # 인덱스 슬라이싱 패치 완료 f[layer][0], f[layer][1]
         means = torch.stack([f[layer][0] for f in feats_list], dim=0).mean(dim=0)
         stds  = torch.stack([f[layer][1] for f in feats_list], dim=0).mean(dim=0)
         avg_feats[layer] = (means, stds)
@@ -276,7 +275,6 @@ def tts_forward(text_ids, text_mask, style_ttl, style_dp, dp_model, te_model, ve
 def save_style(path, style_ttl, style_dp, source_file=None):
     source_meta = list(source_file) if isinstance(source_file, (list, tuple)) else (source_file or "unknown")
     
-    # [차원 수치 규격 정상 보정완료]
     style_json  = {
         "style_ttl": {"data": style_ttl.detach().cpu().numpy().tolist(), "dims": [1, 50, 256], "type": "float32"},
         "style_dp":  {"data": style_dp.detach().cpu().numpy().tolist(),  "dims": [1, 8, 16],   "type": "float32"},
@@ -289,7 +287,8 @@ def save_style(path, style_ttl, style_dp, source_file=None):
 
 def main():
     _patch_onnx2torch()
-    arg = sys.argv if len(sys.argv) > 1 else "configs/caelus.json"
+    # 인자 추출 방식 인덱싱 버그 픽스 완료
+    arg = sys.argv[1] if len(sys.argv) > 1 else "configs/caelus.json"
     
     if os.path.exists(arg):
         config_path = arg
@@ -368,7 +367,6 @@ def main():
     ref_style = load_voice_style(ref_style_path)
 
     with torch.no_grad():
-        # [데이터 분할 대입 패치 완료] text_inputs[0][0], text_inputs[0][1]
         init_dur = dp_model(text_inputs[0][0], torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE), text_inputs[0][1]) / speed
         latent_len = int(np.ceil((init_dur.item() * 44100) / (tts.base_chunk_size * tts.chunk_compress_factor)))
         noisy_latent_fixed = torch.tensor(np.random.randn(1, tts.ldim * tts.chunk_compress_factor, latent_len).astype(np.float32)).to(DEVICE)
@@ -404,7 +402,7 @@ def main():
 
         if multi_wav_mode == "stochastic" and len(target_feats_list) > 1:
             k = min(2, len(target_feats_list))
-            batch_indices = random.sample(range(len(target_wav_paths)), k) # 패치 대상 수동 검증 완료
+            batch_indices = random.sample(range(len(target_feats_list)), k)
             current_target_feats = average_wavlm_features([target_feats_list[i] for i in batch_indices])
             if use_ecapa and ecapa:
                 current_target_ecapa = F.normalize(torch.stack([target_ecapa_emb_list[i] for i in batch_indices], dim=0).mean(dim=0), dim=1)
@@ -435,7 +433,6 @@ def main():
             best_ttl = style_ttl.detach().clone()
             best_dp = style_dp.detach().clone()
 
-        # [리스트 인덱싱 오류 보정 패치 완료]
         if (step + 1) % 10 == 0:
             current_lr = optimizer.param_groups[0]['lr']
             mode_str = "[웜다운 정렬]" if warmdown_mode else "[일반 탐색]"
