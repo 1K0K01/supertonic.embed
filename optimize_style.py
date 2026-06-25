@@ -250,7 +250,8 @@ def wavlm_primary_loss(wavlm, gen_wav, target_features, layer=3):
             + F.mse_loss(gen_feat.std(dim=1), tgt_std))
 
 def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features,
-                               layers=WAVLM_LAYERS, weights=WAVLM_LAYER_WEIGHTS):
+                               layers=WAVLM_LAYERS, weights=WAVLM_LAYER_WEIGHTS,
+                               hf_weight=0.05):
     """
     WavLM 다중 레이어 손실 + 4kHz 이상 고주파 억제 RFFT 보조 손실.
 
@@ -281,7 +282,6 @@ def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features,
     rfft_loss   = F.l1_loss(gen_fft_mag * hf_mask,
                              torch.zeros_like(gen_fft_mag * hf_mask))
 
-    hf_weight  = 0.05
     total_loss = wavlm_loss + (hf_weight * rfft_loss)
     return total_loss
 
@@ -391,6 +391,7 @@ def main():
     seed          = cfg.get("seed", 42)
     lr            = cfg.get("lr", 2e-4)
     dp_lr_ratio   = cfg.get("dp_lr_ratio", 0.008)
+    hf_weight     = cfg.get("hf_weight", 0.05)   # Cell 9에서 설정한 고주파 억제 강도
     train_dp      = cfg.get("train_style_dp", True)
     num_steps     = cfg.get("num_steps", 3000)
     total_step    = cfg.get("total_step", 5)
@@ -522,7 +523,7 @@ def main():
     start_time  = time.time()
 
     print(f"\n[Dynamic Optimization 구동] 목표 임계치: {threshold}")
-    print(f"  speed={speed} | dp_lr_ratio={dp_lr_ratio} | multi_wav_mode={multi_wav_mode}")
+    print(f"  speed={speed} | dp_lr_ratio={dp_lr_ratio} | hf_weight={hf_weight} | multi_wav_mode={multi_wav_mode}")
     print(f"  학습 구간: step {start_step + 1} → {num_steps}\n")
 
     for step in range(start_step, num_steps):
@@ -571,7 +572,7 @@ def main():
         gen_wav = wav_out.squeeze()
 
         loss = wavlm_hybrid_feature_loss(wavlm, gen_wav, current_target_feats,
-                                          layers=WAVLM_LAYERS)
+                                          layers=WAVLM_LAYERS, hf_weight=hf_weight)
 
         if use_ecapa and ecapa is not None and current_target_ecapa is not None:
             loss = loss + (ecapa_weight * ecapa_loss_fn(ecapa, gen_wav, current_target_ecapa))
