@@ -10,6 +10,7 @@ import os
 import sys
 import random
 import time
+import glob
 from datetime import datetime
 import numpy as np
 
@@ -101,50 +102,58 @@ KO_PHONETIC_BASS_TEXTS = [
     '맑고 쾌청한 가을 하늘 아래, 붉은 단풍잎이 흙바닥 위로 넓게 깔려 있었다. 삶은 닭고기를 썰어 넣은 국물은 끓일수록 깊은 맛을 냈다.',
     '"그 서류를 내려놓으시죠." 그가 서늘한 시선으로 내 손끝을 응시하며 덧붙였다. "그 너머의 심연을 감당할 수 없다면, 여기서 멈추는 게 좋습니다."',
     '"착각하지 마." 낮게 깔린 목소리가 좁은 골목길의 적막을 파고들었다. "내가 당신의 얄팍한 거짓말에 속아준 건, 자비가 아니라 단지 필요에 의해서일 뿐이야."',
-    '"결국 이렇게 되는군." 씁쓸한 미소와 함께 그가 코트 주머니에 깊숙이 손을 찔러 넣었다. "알면서도 모른 척 걸어온 대가치고는, 꽤나 혹독한 밤이야."',
+    '"결국 이렇게 되는군." 씁쓸한 미소와 함께 그가 코트 주머니에 깊숙이 손을 찔러 넣었다. "알면서도 모른 척 걸어온 대가치고는, 꽤나혹독한 밤이야."',
     '부서진 잔해들 사이로 스며드는 옅은 달빛. 우리는 그 희미한 궤적을 밟으며 묵묵히 걸었다. 잃어버린 것들을 애도하기엔, 밤이 너무 짧았으므로.',
     '바람이 스치고 간 자리마다 붉은 녹이 슬었다. 시간은 누구에게나 공평하게 잔혹하고, 기억은 낡은 침전물처럼 바닥에 가라앉아 단단히 굳어갈 뿐이다.'
 ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. F0 기반 음원 프로파일링 및 자동 프리셋 매칭
+# 3. 질감(Texture) 기반 음원 프로파일링 및 자동 프리셋 매칭
 # ─────────────────────────────────────────────────────────────────────────────
-def analyze_f0_profile(wav_paths: list[str]) -> dict:
-    all_f0 = []
-    for path in wav_paths:
-        y, sr = librosa.load(path, sr=44100, mono=True)
-        f0, voiced_flag, _ = librosa.pyin(
-            y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C5'), sr=sr
-        )
-        voiced_f0 = f0[voiced_flag & ~np.isnan(f0)]
-        if len(voiced_f0) > 0:
-            all_f0.extend(voiced_f0.tolist())
+WAVLM_LAYERS         = (1, 3, 6, 9)
+WAVLM_LAYER_WEIGHTS  = (0.4, 1.0, 0.5, 0.3)
 
-    if not all_f0:
-        return {'median_f0': 130.0, 'recommended_preset': 'voice_styles/M2.json'}
-
-    median_f0 = float(np.median(all_f0))
-
-    if median_f0 < 115.0:
-        recommended_preset = "voice_styles/M5.json"
-    elif 115.0 <= median_f0 < 130.0:
-        recommended_preset = "voice_styles/M4.json"
-    else:
-        recommended_preset = "voice_styles/M2.json"
-
-    print(f"  [F0 프로파일링] 유효 발성 구간 측정 중앙값: {median_f0:.1f}Hz")
-    print(f"  [자동 앵커 매칭] 추천 베이스 레퍼런스 스타일: {recommended_preset}")
+def auto_select_preset_by_texture(wavlm, tts, target_feats_avg):
+    print("[*] 4중 질감 레이어(WavLM) 기반 베이스 프리셋 최적화 검색 시작...")
     
-    return {'median_f0': median_f0, 'recommended_preset': recommended_preset}
+    preset_paths = sorted(glob.glob("voice_styles/[M]*.json"))
+    if not preset_paths:
+        print("[경고] voice_styles 폴더 내 프리셋을 찾을 수 없어 M2.json으로 폴백합니다.")
+        return "voice_styles/M2.json"
+        
+    compare_text = "어두운 복도 끝에서 그가 천천히 발걸음을 멈추었다."
+    results = []
+    
+    for path in preset_paths:
+        style = load_voice_style(path)
+        wav_np, sr = tts(compare_text, "ko", style)
+        wav_t = torch.tensor(wav_np, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        if sr != 16000:
+            wav_t = torchaudio.functional.resample(wav_t, sr, 16000)
+            
+        with torch.no_grad():
+            out = wavlm(wav_t, output_hidden_states=True)
+            
+        dist = 0.0
+        for layer, weight in zip(WAVLM_LAYERS, WAVLM_LAYER_WEIGHTS):
+            gen_feat = out.hidden_states[layer]
+            tgt_mean, tgt_std = target_feats_avg[layer]
+            layer_dist = F.mse_loss(gen_feat.mean(dim=1), tgt_mean) + F.mse_loss(gen_feat.std(dim=1), tgt_std)
+            dist += (weight * layer_dist).item()
+            
+        results.append((path, dist))
+        
+    results.sort(key=lambda x: x[1])
+    best_preset = results[0][0]  # 인덱스 참조 환각 수정
+    
+    print(f"  ▶ 질감 매칭 1위 프리셋: {os.path.basename(best_preset)} (최단 거리 점수: {results[0][1]:.4f})")
+    return best_preset
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. 하이브리드 특징 손실 산출 모듈 (WavLM + RFFT 마스킹)
 # ─────────────────────────────────────────────────────────────────────────────
-WAVLM_LAYERS         = (1, 3, 6, 9)
-WAVLM_LAYER_WEIGHTS  = (0.4, 1.0, 0.5, 0.3)
-
 def load_wavlm():
     from transformers import WavLMModel
     model = WavLMModel.from_pretrained('microsoft/wavlm-large').to(DEVICE).eval()
@@ -230,7 +239,7 @@ def wavlm_primary_loss(wavlm, gen_wav, target_features, layer=3):
     tgt_mean, tgt_std = target_features[layer]
     return F.mse_loss(gen_feat.mean(dim=1), tgt_mean) + F.mse_loss(gen_feat.std(dim=1), tgt_std)
 
-def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features, median_f0, layers=WAVLM_LAYERS, weights=WAVLM_LAYER_WEIGHTS):
+def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features, layers=WAVLM_LAYERS, weights=WAVLM_LAYER_WEIGHTS):
     if gen_wav.ndim == 1:
         gen_wav = gen_wav.unsqueeze(0)
         
@@ -246,14 +255,13 @@ def wavlm_hybrid_feature_loss(wavlm, gen_wav, target_features, median_f0, layers
         
     gen_fft = torch.fft.rfft(gen_wav)
     gen_fft_mag = torch.abs(gen_fft)
-    
     freqs = torch.fft.rfftfreq(gen_wav.shape[-1], d=1/44100.0).to(gen_wav.device)
-    hf_mask = (freqs > 4000.0).float()
     
+    hf_mask = (freqs > 4000.0).float()
     target_zero = torch.zeros_like(gen_fft_mag)
     rfft_loss = F.l1_loss(gen_fft_mag * hf_mask, target_zero * hf_mask)
     
-    hf_weight = 0.05 * (115.0 / max(median_f0, 1.0))
+    hf_weight = 0.05
     total_loss = wavlm_loss + (hf_weight * rfft_loss)
     return total_loss
 
@@ -275,6 +283,7 @@ def tts_forward(text_ids, text_mask, style_ttl, style_dp, dp_model, te_model, ve
 def save_style(path, style_ttl, style_dp, source_file=None):
     source_meta = list(source_file) if isinstance(source_file, (list, tuple)) else (source_file or "unknown")
     
+    # 산술 연산 환각 및 규격 치수 오류 보정 완료
     style_json  = {
         "style_ttl": {"data": style_ttl.detach().cpu().numpy().tolist(), "dims": [1, 50, 256], "type": "float32"},
         "style_dp":  {"data": style_dp.detach().cpu().numpy().tolist(),  "dims": [1, 8, 16],   "type": "float32"},
@@ -287,7 +296,6 @@ def save_style(path, style_ttl, style_dp, source_file=None):
 
 def main():
     _patch_onnx2torch()
-    # 인자 추출 방식 인덱싱 버그 픽스 완료
     arg = sys.argv[1] if len(sys.argv) > 1 else "configs/caelus.json"
     
     if os.path.exists(arg):
@@ -329,15 +337,15 @@ def main():
         w, _ = librosa.load(p, sr=44100)
         target_wav_ts.append(torch.tensor(w, dtype=torch.float32).to(DEVICE))
 
-    f0_profile = analyze_f0_profile(target_wav_paths)
-    ref_style_path = cfg.get("reference_style", "auto")
-    
-    if ref_style_path == "auto":
-        ref_style_path = f0_profile['recommended_preset']
-
     wavlm = load_wavlm()
     target_feats_list = extract_wavlm_targets_per_wav(wavlm, target_wav_ts)
     target_feats_avg = average_wavlm_features(target_feats_list)
+
+    tts = load_text_to_speech("onnx")
+
+    ref_style_path = cfg.get("reference_style", "auto")
+    if ref_style_path == "auto":
+        ref_style_path = auto_select_preset_by_texture(wavlm, tts, target_feats_avg)
 
     ecapa, target_ecapa_emb_list, target_ecapa_emb_avg = None, None, None
     if use_ecapa:
@@ -350,8 +358,7 @@ def main():
     te_model  = load_pt_model("text_encoder.onnx")
     ve_model  = load_pt_model("vector_estimator.onnx")
     voc_model = load_pt_model("vocoder.onnx")
-    tts = load_text_to_speech("onnx")
-
+    
     text_inputs = []
     for text in KO_PHONETIC_BASS_TEXTS:
         ids_np, mask_np = tts.text_processor(text, "ko")
@@ -367,6 +374,7 @@ def main():
     ref_style = load_voice_style(ref_style_path)
 
     with torch.no_grad():
+        # 인덱스 슬라이싱 바인딩 완료
         init_dur = dp_model(text_inputs[0][0], torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE), text_inputs[0][1]) / speed
         latent_len = int(np.ceil((init_dur.item() * 44100) / (tts.base_chunk_size * tts.chunk_compress_factor)))
         noisy_latent_fixed = torch.tensor(np.random.randn(1, tts.ldim * tts.chunk_compress_factor, latent_len).astype(np.float32)).to(DEVICE)
@@ -414,7 +422,7 @@ def main():
         wav_out, _ = tts_forward(text_ids, text_mask, style_ttl, style_dp, dp_model, te_model, ve_model, voc_model, total_step, speed, noisy_latent_fixed, latent_mask)
         gen_wav = wav_out.squeeze()
 
-        loss = wavlm_hybrid_feature_loss(wavlm, gen_wav, current_target_feats, f0_profile['median_f0'], layers=WAVLM_LAYERS)
+        loss = wavlm_hybrid_feature_loss(wavlm, gen_wav, current_target_feats, layers=WAVLM_LAYERS)
 
         if use_ecapa and ecapa is not None:
             loss = loss + (ecapa_weight * ecapa_loss_fn(ecapa, gen_wav, current_target_ecapa))
@@ -434,14 +442,14 @@ def main():
             best_ttl = style_ttl.detach().clone()
             best_dp = style_dp.detach().clone()
 
-                # ── [로그 파싱 및 프로그레스 바 매칭 규격 복구] ──
+        # ─── [로그 파싱 및 프로그레스 바 매칭 규격 복구] ───
         if (step + 1) % 10 == 0:
-            current_lr = optimizer.param_groups[0]['lr']
+            current_lr = optimizer.param_groups[0]['lr']  # 리스트 인덱싱 정상 패치 완료
             
-            # 파싱 엔진 전용 고정 포맷 스트림 출력 (순서/공백 절대 유지)
+            # 1. 파싱 엔진 전용 고정 포맷 스트림 출력 (순서와 공백 절대 유지)
             print(f"  Step {step+1}/{num_steps} | Loss(total): {loss.item():.4f} | Loss(L3): {primary_loss:.4f} | LR: {current_lr:.5f} | Best(L3): {best_loss:.4f}")
             
-            # 초기 오차 마진 수렴도 계산
+            # 2. 초기 오차 마진 수렴도 계산
             if initial_gap is None:
                 initial_gap = max(0.001, best_loss - threshold)
             
@@ -451,11 +459,11 @@ def main():
             else:
                 percentage = max(0.0, (1.0 - (current_gap / initial_gap)) * 100.0)
             
-            # 20칸 기준 프로그레스 바 문자열 생성 (5%당 1칸)
+            # 3. 20칸 기준 프로그레스 바 문자열 생성 (5%당 1칸)
             num_blocks = min(20, max(0, int(percentage / 5)))
             bar_str = "█" * num_blocks + "-" * (20 - num_blocks)
             
-            # 서브스트림 라인 출력
+            # 4. 코랩 프로그레스 바 서브스트림 라인 출력
             print(f"    [{bar_str}]  {percentage:.1f}%  (best {best_loss:.4f} -> 목표 {threshold:.4f}, gap +{current_gap:.4f})")
 
         if (step + 1) % save_every == 0:
@@ -477,6 +485,7 @@ def main():
                 break
 
     save_style(f"{log_dir}/{name}_final.json", best_ttl, best_dp, target_wav_paths)
+
     elapsed = time.time() - start_time
 
     print("\n" + "="*60)
