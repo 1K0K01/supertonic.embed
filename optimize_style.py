@@ -530,7 +530,7 @@ def main():
         optimizer.zero_grad()
 
         # DP warmup: L3 loss가 0.30 이하로 내려오면 즉시 활성화
-        # 단, 초반 50스텝은 style_ttl 안정화를 위해 DP 동결 유지
+        # 단, 초반 200스텝은 style_ttl 안정화를 위해 DP 동결 유지
         if train_dp and not style_dp.requires_grad:
             if best_loss <= 0.30 or step >= start_step + 50:
                 style_dp.requires_grad_(True)
@@ -627,7 +627,7 @@ def main():
         # ── Warmdown (조기 종료 전 미세 정렬) ────────────────────────────────
         if not warmdown_mode and best_loss <= threshold:
             print(f"\n>>> [Phase Transition] Best L3 Loss Threshold({threshold}) 도달!")
-            print(">>> Dynamic Warm-down 모드 활성화 (LR x0.05, 최대 50스텝 추가 정렬)")
+            print(">>> Dynamic Warm-down 모드 활성화 (LR x0.05, 최대 200스텝 추가 정렬)")
             warmdown_mode = True
             for pg in optimizer.param_groups:
                 pg['lr'] = pg['lr'] * 0.05
