@@ -517,7 +517,7 @@ def main():
     best_dp        = style_dp.detach().clone()
     warmdown_mode  = False
     warmdown_steps = 0
-    MAX_WARMDOWN   = 50
+    MAX_WARMDOWN   = 200
 
     initial_gap = None
     start_time  = time.time()
