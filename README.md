@@ -160,17 +160,18 @@ python optimize_style.py my_voice
 
 ---
 
-### 성능 (원본 논문 기준)
+## 성능 (원본 논문 기준)
 
 44명 화자 × 5 발화 = 220개 샘플 평가:
 
- SIM (WavLM) ↑ SIM (ECAPA) ↑ SIM (ResNet) ↑ WER ↓
-최근접 프리셋 (최적화 없음) 0.758 0.129 0.112 4.80%
-제안 방법 0.867 0.452 0.446 2.70%
+| | SIM (WavLM) ↑ | SIM (ECAPA) ↑ | SIM (ResNet) ↑ | WER ↓ |
+|---|---|---|---|---|
+| 최근접 프리셋 (최적화 없음) | 0.758 | 0.129 | 0.112 | 4.80% |
+| **제안 방법** | **0.867** | **0.452** | **0.446** | **2.70%** |
 
 ---
 
-### 파일 구조
+## 파일 구조
 
 ```
 configs/                  # 학습 설정
@@ -205,26 +206,26 @@ results/                  # 테스트 출력
 
 ---
 
-### 사용 모델
+## 사용 모델
 
-모델 역할
-duration_predictor 지속 시간 예측 (SupertonicTTS)
-text_encoder 텍스트 인코딩 (SupertonicTTS)
-vector_estimator Flow Matching 노이즈 제거 (SupertonicTTS)
-vocoder 잠재 벡터 → WAV (SupertonicTTS)
-WavLM-Large 지각 손실, Layer 3 (microsoft/wavlm-large)
+| 모델 | 역할 |
+|------|------|
+| duration_predictor | 지속 시간 예측 (SupertonicTTS) |
+| text_encoder | 텍스트 인코딩 (SupertonicTTS) |
+| vector_estimator | Flow Matching 노이즈 제거 (SupertonicTTS) |
+| vocoder | 잠재 벡터 → WAV (SupertonicTTS) |
+| WavLM-Large | 지각 손실, Layer 3 (microsoft/wavlm-large) |
 
 ---
 
-### 기술적 상세
+## 기술적 상세
 
-ONNX → PyTorch 변환
+### ONNX → PyTorch 변환
 
 경사 역전파를 위해 ONNX 모델을 PyTorch로 변환합니다:
-
-· onnxslim으로 모델 정리
-· opset 17 강제 지정 (onnx2torch 호환성)
-· Clip 노드의 빈 입력 수정
+- onnxslim으로 모델 정리
+- opset 17 강제 지정 (onnx2torch 호환성)
+- Clip 노드의 빈 입력 수정
 
 ### WavLM Layer 3 특징 매칭
 
@@ -232,14 +233,14 @@ Chiu et al. (2025)의 연구에 따르면, WavLM Layer 3가 화자 정체성을 
 
 ### 스타일 공간
 
-· style_ttl [1, 50, 256] = 12,800개 파라미터 (음색, 최적화 대상)
-· style_dp [1, 8, 16] = 128개 파라미터 (리듬/지속 시간, 선택적 학습)
+- style_ttl [1, 50, 256] = 12,800개 파라미터 (음색, 최적화 대상)
+- style_dp [1, 8, 16] = 128개 파라미터 (리듬/지속 시간, 선택적 학습)
 
 남성과 여성 음성은 스타일 공간에서 서로 다른 영역을 차지합니다. 가장 가까운 프리셋 스타일에서 시작하는 것이 중요합니다.
 
 ---
 
-### 인용 (Citation)
+## 인용 (Citation)
 
 이 작업을 사용한다면 다음을 인용해 주세요:
 
@@ -257,3 +258,7 @@ Chiu et al. (2025)의 연구에 따르면, WavLM Layer 3가 화자 정체성을 
 Zenodo 프리프린트: https://doi.org/10.5281/zenodo.19646514
 
 ---
+
+## 도움말 (Looking for help?)
+
+질문이 있으시면 자유롭게 이슈를 열어 주세요.
