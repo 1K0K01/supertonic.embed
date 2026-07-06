@@ -697,7 +697,9 @@ def main():
                 print(f"\n>>> [DP 활성화] Step {step+1}: L3={best_loss:.4f} → style_dp 학습 시작")
 
         # ── 샘플 선택: 페어드 vs 일반 ───────────────────────────────────────
-        use_paired = (paired_mode and random.random() < paired_ratio)
+        # 웜다운 진입 시 범용 발음 교정을 위해 페어드 비율을 0.3으로 하향
+        current_paired_ratio = 0.3 if warmdown_mode else paired_ratio
+        use_paired = (paired_mode and random.random() < current_paired_ratio)
 
         if use_paired:
             pi = random.randrange(len(paired_text_inputs))
