@@ -1,4 +1,3 @@
-```markdown
 # SupertonicTTS 보이스 스타일 추출기 (한국어 남성 저음 특화 개조판)
 
 이 저장소는 SupertonicTTS의 공식 스타일 인코더(미공개) 없이, **어떤 WAV 파일에서도 음성 스타일 임베딩을 추출**할 수 있게 안내합니다.
@@ -257,9 +256,3 @@ Chiu et al. (2025)의 연구에 따르면, WavLM Layer 3가 화자 정체성을 
 Zenodo 프리프린트: https://doi.org/10.5281/zenodo.19646514
 
 ---
-
-도움말 (Looking for help?)
-
-질문이 있으시면 자유롭게 이슈를 열어 주세요.
-
-```
