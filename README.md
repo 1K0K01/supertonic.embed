@@ -76,17 +76,17 @@
 pip install -r requirements.txt
 ```
 
-2. SupertonicTTS 모델 다운로드
+### 2. SupertonicTTS 모델 다운로드
 
 Supertone/supertonic-2에서 onnx/와 voice_styles/ 폴더를 다운로드하여 프로젝트 루트에 배치하세요.
 
-3. 음성 샘플 준비
+### 3. 음성 샘플 준비
 
 WAV 파일(3~10초, 단일 화자)을 wavs/ 폴더에 넣으세요. 샘플레이트는 자동으로 44.1kHz로 리샘플링됩니다.
 
-4. Config 생성
+### 4. Config 생성
 
-configs/my_voice.json 예시:
+`configs/my_voice.json` 예시:
 
 ```json
 {
@@ -114,30 +114,31 @@ configs/my_voice.json 예시:
 }
 ```
 
-파라미터 설명
-name 체크포인트 및 결과 파일 저장 이름
-target_wavs 음성 클로닝에 사용할 WAV 파일 경로 리스트
-multi_wav_mode "stochastic" (랜덤 샘플링) 또는 "average" (평균 고정)
-reference_style "auto" (자동 선택) 또는 "voice_styles/F1.json" (수동)
-seed 재현성을 위한 랜덤 시드
-lr 학습률. 1.2e-4 ~ 1.5e-4 권장. 너무 높으면 발음이 깨짐
-num_steps 최대 최적화 스텝 (조기 종료가 더 빠를 수 있음)
-total_step Flow Matching 반복 횟수 (5=학습용, 10~15=합성 품질용)
-speed 발화 속도 (1.00~1.05 권장)
-save_every 체크포인트 저장 간격
-early_stop_loss_threshold Layer 3 손실 조기 종료 임계값 (0.13~0.17)
-train_style_dp style_dp 학습 여부 (페어드 모드에서만 의미)
-dp_lr_ratio style_dp 학습률 비율 (0.001~0.005)
-use_ecapa_loss ECAPA 화자 정체성 손실 사용 여부
-ecapa_loss_weight ECAPA 손실 가중치 (0.35~0.40)
-hf_weight 4kHz 이상 고주파 억제 강도 (0.08~0.15)
-ltas_weight LTAS 스펙트럼 매칭 손실 가중치 (0.2~0.5, 0=끔)
-target_texts (페어드 모드) 각 WAV에 대응하는 실제 대사 리스트
-seq_loss_weight 페어드 시퀀스(운율) 손실 가중치 (0.1~0.3)
-dur_loss_weight 페어드 발화 길이 손실 가중치 (0.1~0.3)
-paired_ratio 페어드 샘플 선택 확률 (0.4~0.7)
+| 파라미터 | 설명 |
+|----------|------|
+| `name` | 체크포인트 및 결과 파일 저장 이름 |
+| `target_wavs` | 음성 클로닝에 사용할 WAV 파일 경로 리스트 |
+| `multi_wav_mode` | `"stochastic"` (랜덤 샘플링) 또는 `"average"` (평균 고정) |
+| `reference_style` | `"auto"` (자동 선택) 또는 `"voice_styles/F1.json"` (수동) |
+| `seed` | 재현성을 위한 랜덤 시드 |
+| `lr` | 학습률. 1.2e-4 ~ 1.5e-4 권장. 너무 높으면 발음이 깨짐 |
+| `num_steps` | 최대 최적화 스텝 (조기 종료가 더 빠를 수 있음) |
+| `total_step` | Flow Matching 반복 횟수 (5=학습용, 10~15=합성 품질용) |
+| `speed` | 발화 속도 (1.00~1.05 권장) |
+| `save_every` | 체크포인트 저장 간격 |
+| `early_stop_loss_threshold` | Layer 3 손실 조기 종료 임계값 (0.13~0.17) |
+| `train_style_dp` | style_dp 학습 여부 (페어드 모드에서만 의미) |
+| `dp_lr_ratio` | style_dp 학습률 비율 (0.001~0.005) |
+| `use_ecapa_loss` | ECAPA 화자 정체성 손실 사용 여부 |
+| `ecapa_loss_weight` | ECAPA 손실 가중치 (0.35~0.40) |
+| `hf_weight` | 4kHz 이상 고주파 억제 강도 (0.08~0.15) |
+| `ltas_weight` | LTAS 스펙트럼 매칭 손실 가중치 (0.2~0.5, 0=끔) |
+| `target_texts` | (페어드 모드) 각 WAV에 대응하는 실제 대사 리스트 |
+| `seq_loss_weight` | 페어드 시퀀스(운율) 손실 가중치 (0.1~0.3) |
+| `dur_loss_weight` | 페어드 발화 길이 손실 가중치 (0.1~0.3) |
+| `paired_ratio` | 페어드 샘플 선택 확률 (0.4~0.7) |
 
-5. 최적화 실행
+### 5. 최적화 실행
 
 ```bash
 python optimize_style.py my_voice
@@ -145,21 +146,21 @@ python optimize_style.py my_voice
 
 중단된 경우 최신 체크포인트에서 자동으로 재개됩니다. 손실이 0.24 이하로 떨어지면 조기 종료됩니다.
 
-6. 추출된 스타일 사용
+### 6. 추출된 스타일 사용
 
-main.py에서 추론 예제를 확인하세요.
-
----
-
-소요 시간
-
-· 모델 로딩 및 변환: ~30초
-· 자동 프리셋 선택: ~1분 (10개 스타일 비교)
-· 최적화: RTX 3090 기준 평균 503스텝, 약 5~6분
+`main.py`에서 추론 예제를 확인하세요.
 
 ---
 
-성능 (원본 논문 기준)
+## 소요 시간
+
+- 모델 로딩 및 변환: ~30초
+- 자동 프리셋 선택: ~1분 (10개 스타일 비교)
+- 최적화: RTX 3090 기준 평균 503스텝, 약 5~6분
+
+---
+
+### 성능 (원본 논문 기준)
 
 44명 화자 × 5 발화 = 220개 샘플 평가:
 
@@ -169,7 +170,7 @@ main.py에서 추론 예제를 확인하세요.
 
 ---
 
-파일 구조
+### 파일 구조
 
 ```
 configs/                  # 학습 설정
@@ -204,7 +205,7 @@ results/                  # 테스트 출력
 
 ---
 
-사용 모델
+### 사용 모델
 
 모델 역할
 duration_predictor 지속 시간 예측 (SupertonicTTS)
@@ -215,7 +216,7 @@ WavLM-Large 지각 손실, Layer 3 (microsoft/wavlm-large)
 
 ---
 
-기술적 상세
+### 기술적 상세
 
 ONNX → PyTorch 변환
 
@@ -225,11 +226,11 @@ ONNX → PyTorch 변환
 · opset 17 강제 지정 (onnx2torch 호환성)
 · Clip 노드의 빈 입력 수정
 
-WavLM Layer 3 특징 매칭
+### WavLM Layer 3 특징 매칭
 
 Chiu et al. (2025)의 연구에 따르면, WavLM Layer 3가 화자 정체성을 가장 잘 인코딩합니다. 생성 오디오와 타겟 오디오의 시간 평균 특징 통계(평균, 표준편차)를 비교합니다. 시간축 평균화는 콘텐츠 의존성을 줄입니다.
 
-스타일 공간
+### 스타일 공간
 
 · style_ttl [1, 50, 256] = 12,800개 파라미터 (음색, 최적화 대상)
 · style_dp [1, 8, 16] = 128개 파라미터 (리듬/지속 시간, 선택적 학습)
@@ -238,7 +239,7 @@ Chiu et al. (2025)의 연구에 따르면, WavLM Layer 3가 화자 정체성을 
 
 ---
 
-인용 (Citation)
+### 인용 (Citation)
 
 이 작업을 사용한다면 다음을 인용해 주세요:
 
