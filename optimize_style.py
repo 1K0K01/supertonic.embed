@@ -236,6 +236,17 @@ def auto_select_preset_by_texture(wavlm, tts, target_feats_avg):
 class SingleScaleSpectralLoss(torch.nn.Module):
     def __init__(self, n_fft, hop_length, win_length):
         super().__init__()
+        # [FIX] torch.stft는 win_length <= n_fft를 항상 요구한다. 이전 버전은
+        # (n_fft=512, win=600) 같은 조합이 들어가 있어 학습 첫 스텝부터
+        # RuntimeError로 죽었다(win_length=600 > n_fft=512). __init__ 시점에
+        # 검증해 잘못된 값이 들어오면 학습을 몇 분~몇 시간 돌리지 않고
+        # 즉시 명확한 에러로 알려준다.
+        assert 0 < win_length <= n_fft, (
+            f"win_length({win_length})는 0보다 크고 n_fft({n_fft}) 이하여야 합니다."
+        )
+        assert 0 < hop_length < win_length, (
+            f"hop_length({hop_length})는 0보다 크고 win_length({win_length}) 미만이어야 합니다."
+        )
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
@@ -245,6 +256,11 @@ class SingleScaleSpectralLoss(torch.nn.Module):
             x = x.squeeze()
         if y.ndim > 1:
             y = y.squeeze()
+
+        # [FIX] 오디오 길이가 n_fft보다 짧으면(페어드 대상이 극단적으로 짧은 경우)
+        # torch.stft가 또 다른 형태로 에러를 낼 수 있어 방어적으로 스킵.
+        if x.numel() < self.n_fft or y.numel() < self.n_fft:
+            return x.new_zeros(())
 
         window = torch.hann_window(self.win_length, device=x.device)
         s_x = torch.stft(x, self.n_fft, self.hop_length, self.win_length,
@@ -261,7 +277,10 @@ class SingleScaleSpectralLoss(torch.nn.Module):
         return converge_loss + log_mag_loss
 
 class MultiScaleSpectralLoss(torch.nn.Module):
-    def __init__(self, scales=(512, 1024, 2048), hops=(120, 240, 480), wins=(600, 1200, 2400)):
+    # [FIX] 기존 (n_fft, win) 짝이 win>n_fft로 어긋나 있던 버그 수정.
+    # ParallelWaveGAN 계열에서 널리 쓰이는 표준 multi-resolution STFT 설정으로 교체.
+    # win_length <= n_fft, hop_length < win_length 가 항상 성립하도록 짝을 맞춤.
+    def __init__(self, scales=(512, 1024, 2048), hops=(50, 120, 240), wins=(240, 600, 1200)):
         super().__init__()
         self.losses = torch.nn.ModuleList([
             SingleScaleSpectralLoss(n_fft, hop, win)
