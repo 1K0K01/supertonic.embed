@@ -980,16 +980,25 @@ def main():
                 print(f"    [주의] style_ttl std({ttl_std:.4f})가 정상 범위(0.06~0.08) 밖입니다. "
                       f"과적합/붕괴 가능성 — lr 또는 threshold 재검토 권장.")
 
-            if initial_gap is None and best_loss < float('inf'):
-                initial_gap = max(0.001, best_loss - threshold)
+            # [FIX-G] 진행률 바를 best_loss(순간 최저치)가 아니라 웜다운 실제
+            # 판정 지표(EMA, 형성 전엔 best_loss 폴백)로 계산하도록 통일.
+            # 기존 버그: best_loss만 보고 100%를 찍어버려서, EMA가 threshold에
+            # 못 미쳐 웜다운이 전혀 시작 안 된 상태에서도 "100%인데 안 끝난다"는
+            # 혼란을 유발했음. 이제 progress_gate가 warmdown 판정과 동일한 값이므로
+            # 100%가 뜨면 실제로 그 다음 스텝에 웜다운이 시작된다.
+            progress_gate = smoothed_l3 if smoothed_l3 is not None else best_loss
+            if initial_gap is None and progress_gate < float('inf'):
+                initial_gap = max(0.001, progress_gate - threshold)
             if initial_gap is not None:
-                current_gap = max(0.0, best_loss - threshold)
+                current_gap = max(0.0, progress_gate - threshold)
                 percentage  = (max(0.0, (1.0 - (current_gap / initial_gap)) * 100.0)
                                if current_gap > 0 else 100.0)
                 num_blocks  = min(20, max(0, int(percentage / 5)))
                 bar_str     = "█" * num_blocks + "-" * (20 - num_blocks)
+                gate_label  = "EMA" if smoothed_l3 is not None else "best(EMA 형성전 임시)"
                 print(f"    [{bar_str}]  {percentage:.1f}%  "
-                      f"(best {best_loss:.4f} -> 목표 {threshold:.4f}, gap +{current_gap:.4f})")
+                      f"({gate_label} {progress_gate:.4f} -> 목표 {threshold:.4f}, "
+                      f"gap +{current_gap:.4f})  [참고: best(순간최저) {best_loss:.4f}]")
 
         # ── 체크포인트 저장 ───────────────────────────────────────────────────
         if (step + 1) % save_every == 0 and best_ttl is not None:
@@ -1000,6 +1009,8 @@ def main():
         # ── Warmdown ─────────────────────────────────────────────────────────
         # [v4] 단일 샘플 best_loss 대신 EMA(smoothed_l3)로 판정 → 조기 락인 방지.
         # EMA가 아직 형성되지 않은 초반 스텝에는 종전처럼 best_loss로 폴백.
+        # [FIX-G] 이 값은 위 progress bar의 progress_gate와 완전히 동일한 계산식이다
+        # (progress bar는 10스텝마다만 찍히므로 별도 변수로 매 스텝 재계산).
         warmdown_gate = smoothed_l3 if smoothed_l3 is not None else best_loss
         if not warmdown_mode and warmdown_gate <= threshold:
             print(f"\n>>> [Phase Transition] EMA(L3) Threshold({threshold}) 도달! "
