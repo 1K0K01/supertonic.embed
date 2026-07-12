@@ -879,10 +879,28 @@ def main():
     else:
         optimizer = torch.optim.Adam([style_ttl], lr=lr)
 
+    # [v9-FIX] v8-FIX가 KeyError는 없앴지만 불완전했음: CosineAnnealingLR을
+    # last_epoch>=0으로 "생성"만 해서는 param_groups['lr']이 즉시 코사인 곡선값으로
+    # 갱신되지 않는다(PyTorch 내부 동작 — 다음 .step() 호출 시에야 "직전 lr 기준
+    # 재귀 공식"을 적용하는데, 이때 직전 lr이 initial_lr(=원본 시작값)로 잘못
+    # 세팅되어 있으면 재귀 공식 자체가 완전히 틀린 값을 계산한다). 실측 결과 step
+    # 5300 재개 시 실제로는 lr≈3.16e-5여야 하는데 v8-FIX는 lr=1.2e-4(원본 시작값
+    # 그대로)로 잘못 시작해, 이미 수렴 근처인 스타일을 큰 lr로 갑자기 흔들 위험이
+    # 있었다. scheduler._get_closed_form_lr()로 재개 시점의 정확한 코사인값을
+    # 명시적으로 계산해 즉시 반영한다(처음부터 연속으로 돌린 경우와 값이 정확히
+    # 일치함을 시뮬레이션으로 검증함).
+    if start_step > 0:
+        for pg in optimizer.param_groups:
+            pg['initial_lr'] = pg['lr']
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_steps, eta_min=lr * 0.01,
         last_epoch=(start_step - 1) if start_step > 0 else -1
     )
+
+    if start_step > 0:
+        for pg, closed_lr in zip(optimizer.param_groups, scheduler._get_closed_form_lr()):
+            pg['lr'] = closed_lr
 
     best_loss      = float('inf')
     best_ttl       = None
