@@ -1,7 +1,33 @@
 """
-optimize_style_v5.py (v4 기반 — v4g/Gemini 리뷰 반영판)
+optimize_style_v7.py (v5 기반 — MultiScaleSpectralLoss 버그 수정 + duration/저역 매칭 강화판)
 ─────────────────────────────────────────────────────────────────────────────
-한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드 — v4 기반 v5
+한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드 — v5 기반 v6/v7
+
+v7 수정/신규 사항 (welt6 음향 분석 기반 — "음색은 근접하나 청감상 가볍다" 대응):
+  [NEW-4] 저역(100-500Hz, 가슴공명대) 타겟 손실 (low_band_weight)
+          F0/spectral centroid median이 원본과 근접해도 청감상 "가볍다"는
+          문제가 실제로 확인됨. LTAS(24밴드 전체 분포) 손실은 gradient가
+          24개 밴드에 분산되어 저역 신호가 상대적으로 약해질 수 있음.
+          compute_ltas_distribution이 이미 계산하는 24밴드 분포에서
+          100-500Hz(인덱스 1~8, 실측 98.2~506.9Hz)의 부분합만 뽑아 그 비율을
+          직접 맞추는 보조 손실 추가. LTAS 계산을 그대로 재사용하므로 추가
+          STFT 없이 거의 무비용 — 학습 속도에 미치는 영향 거의 없음.
+  [NEW-5] 학습 완료 시 저역 비율 매칭 결과를 duration 검증과 함께 실측 리포트.
+          duration 사후 검증에서 이미 호출하는 tts_forward의 wav 출력을
+          재사용(추가 forward 없음)해 저역 오차(%p)까지 같이 보여줌.
+
+v6 수정/신규 사항 (welt6 학습에서 실측된 문제 대응):
+  [FIX-H] dp_lr_ratio 과소 설정 경고
+          effective dp lr = lr * dp_lr_ratio가 너무 작으면(<0.005) style_dp가
+          사실상 학습되지 않아 duration이 어긋난다(welt6에서 최대 +25% 관측).
+          학습 시작 시 즉시 경고.
+  [FIX-I] 웜다운 시 style_dp 그룹 별도 스케일(warmdown_dp_lr_scale, 기본 1.0)
+          기존엔 웜다운이 style_ttl/style_dp 모두 동일하게 x0.05로 낮춰서,
+          duration이 덜 수렴한 상태에서 웜다운에 들어가도 그대로 얼어붙었음.
+          기본값 1.0(안 낮춤)으로 웜다운 구간(+최대 50스텝)에도 dp가 계속
+          개선될 여지를 남김.
+  [NEW-3.5] 학습 완료 시 각 페어드 타겟에 대해 duration 오차를 실측 리포트.
+          음원을 직접 들어보기 전에 로그만으로 duration 문제를 조기 발견 가능.
 
 v5 수정/신규 사항 (v4g[Gemini]가 제안한 3개 기법 검토 후 반영):
   [ADOPT] style_reg_weight (std 0.06~0.08 경계 페널티)
@@ -17,7 +43,8 @@ v5 수정/신규 사항 (v4g[Gemini]가 제안한 3개 기법 검토 후 반영)
           파형을 F.interpolate로 강제 정렬해 duration 미수렴 구간(학습 초반)에
           오정렬 프레임 비교로 인한 노이즈 그래디언트 위험이 있음. dur 오차율이
           mss_dur_tolerance(기본 0.15) 이내인 페어드 스텝에서만 게이팅 적용하도록
-          안전장치 추가.
+          안전장치 추가. n_fft/win_length 짝이 잘못 매칭되어(win>n_fft) 학습
+          시작 즉시 RuntimeError로 죽던 버그도 표준 PWG 설정으로 수정.
   [REJECT] VAD 기반 순수 발화 길이(librosa.effects.split)로 dur_loss 타겟 변경
           v4g는 문장 내부 모든 무음을 제거한 "순수 유성음 합"을 dur 타겟으로
           썼으나, 모델이 예측하는 dur은 문장부호에 따른 자연스러운 쉼을 포함한
@@ -64,10 +91,12 @@ v3 수정/신규 사항:
   "target_texts":              ["대사1", "대사2", ...]  # target_wavs와 1:1 순서 대응
   "hf_weight":                  0.05
   "ltas_weight":                0.2                      # v4: 기본값 하향
+  "low_band_weight":            0.1                       # v7 신규 (저역 비율 타겟)
   "seq_loss_weight":            0.3
   "dur_loss_weight":            0.3
   "paired_ratio":               0.7
   "warmdown_paired_ratio":      0.3                      # v4 신규
+  "warmdown_dp_lr_scale":       1.0                       # v6 신규
   "early_stop_ema_alpha":       0.08                      # v4 신규
   "style_reg_weight":           0.05                      # v5 신규 (std 경계 페널티)
   "style_reg_ref_anchor_weight":0.0                       # v5 신규 (기본 꺼짐)
@@ -419,6 +448,31 @@ def ltas_loss_fn(gen_wav, target_ltas):
                      torch.log10(target_ltas + 1e-8))
 
 
+# [v7-NEW] 저역(중후함/가슴공명대) 타겟 손실.
+# ─────────────────────────────────────────────────────────────────────────────
+# welt6 음향 분석에서 F0/centroid는 원본과 근접했지만 실제 청취 시 "가볍다"는
+# 인상이 확인됨. 원인 분석 결과 centroid(가중평균 하나의 스칼라)는 저역 비율의
+# 미세한 변화나 음량 차이로 인한 청감 효과를 못 잡는다는 게 확인됨. LTAS 손실
+# (24밴드 로그분포 L1)은 전체 분포 형태를 맞추려 하지만, 24개 밴드에 걸쳐
+# gradient가 분산되므로 특정 대역(저역)에 대한 신호가 상대적으로 약해질 수 있음.
+# → LTAS와 동일한 24밴드 분포(compute_ltas_distribution)에서 100~500Hz에 해당하는
+#   밴드(인덱스 1~8, 실측 98.2~506.9Hz)의 부분합만 뽑아 그 비율을 직접 맞추는
+#   보조 손실을 추가. LTAS 계산을 그대로 재사용하므로 추가 STFT/rfft 없이 거의
+#   공짜로 계산됨(학습 속도에 영향 거의 없음).
+LOW_BAND_IDX = list(range(1, 9))  # 98.2~506.9Hz, 100-500Hz 목표 범위와 거의 정확히 일치
+
+def low_band_ratio(ltas_dist):
+    """[N_LTAS_BANDS] 정규화 분포 → 저역(100-500Hz) 에너지 비율 스칼라."""
+    return ltas_dist[LOW_BAND_IDX].sum()
+
+def low_band_loss_fn(gen_wav, target_ltas):
+    """생성 음성과 타겟의 저역 비율 차이를 직접 패널티. LTAS 분포를 재사용."""
+    gen_ltas = compute_ltas_distribution(gen_wav)
+    gen_low  = low_band_ratio(gen_ltas)
+    tgt_low  = low_band_ratio(target_ltas)
+    return F.mse_loss(gen_low, tgt_low)
+
+
 def wavlm_primary_loss(wavlm, gen_wav, target_features, layer=3):
     """Layer 3 단독 손실 — 조기 종료 임계값 비교 기준."""
     if gen_wav.ndim == 1:
@@ -618,6 +672,16 @@ def main():
     save_every    = cfg.get("save_every", 100)
     threshold     = cfg.get("early_stop_loss_threshold", 0.18)
     use_ecapa     = cfg.get("use_ecapa_loss", True)
+    # [v6-NEW] dp_lr_ratio가 지나치게 작으면 style_dp가 사실상 학습되지 않아
+    # duration(발화 길이) 매칭이 실패한다. welt6 학습에서 dp_lr_ratio=0.001로
+    # effective lr이 1e-7대까지 떨어져 합성 음성이 원본보다 최대 25% 길어지는
+    # 문제가 실제로 관측되어 경고를 추가한다.
+    _DP_LR_RATIO_WARN_THRESHOLD = 0.005
+    if train_dp and dp_lr_ratio < _DP_LR_RATIO_WARN_THRESHOLD:
+        print(f"[경고] dp_lr_ratio={dp_lr_ratio}가 매우 작습니다 "
+              f"(effective dp lr = {lr * dp_lr_ratio:.2e}). style_dp가 사실상 학습되지 "
+              f"않아 duration(발화 속도/길이) 매칭이 실패할 수 있습니다. "
+              f"0.01~0.03 정도를 권장합니다.")
     ecapa_weight  = cfg.get("ecapa_loss_weight", 0.3)
 
     # [FIX-A] hf_weight config 연동 + 신규 손실 가중치들
@@ -626,6 +690,11 @@ def main():
     #      config에 값을 넣으면 그 값이 우선하므로 기존 실험 재현성은 유지됨.
     hf_weight       = cfg.get("hf_weight", 0.05)
     ltas_weight     = cfg.get("ltas_weight", 0.2)
+    # [v7-NEW] 저역(100-500Hz, 중후함/가슴공명대) 타겟 손실 가중치.
+    # LTAS(24밴드 전체 분포) 손실과 별개로, 저역 비율만 직접 맞추는 보조 손실.
+    # ltas_weight보다 작게 시작하는 걸 권장(과하면 저역만 밀어붙이다 다른 대역
+    # 밸런스가 깨질 수 있음). 기본 0.1, 0=끔.
+    low_band_weight = cfg.get("low_band_weight", 0.1)
     seq_loss_weight = cfg.get("seq_loss_weight", 0.3)
     dur_loss_weight = cfg.get("dur_loss_weight", 0.3)
     paired_ratio    = cfg.get("paired_ratio", 0.7)
@@ -635,6 +704,14 @@ def main():
     # [v4-NEW] 조기종료 판정용 EMA 평활 계수. 값이 작을수록 더 많은 스텝의
     # 평균을 반영해 "운 좋은 샘플 1개"로 인한 조기 락인을 방지한다.
     early_stop_ema_alpha = cfg.get("early_stop_ema_alpha", 0.08)
+    # [v6-NEW] 웜다운 시 style_dp 그룹에 적용할 별도 LR 스케일.
+    # 기존 버그: 웜다운이 모든 param_group(style_ttl, style_dp)의 LR을 동일하게
+    # x0.05로 낮췄는데, style_dp는 이미 dp_lr_ratio로 낮게 잡혀 있어 웜다운
+    # 진입 시점에 duration 매칭이 아직 안 끝났어도 그대로 사실상 동결되어버림
+    # (welt6에서 합성이 원본보다 최대 25% 길어진 원인). 기본값 1.0 = 웜다운 때도
+    # style_dp는 낮추지 않고 style_ttl만 낮춰서, duration이 웜다운 구간
+    # (+최대 50스텝)에서도 계속 개선될 여지를 남긴다.
+    warmdown_dp_lr_scale = cfg.get("warmdown_dp_lr_scale", 1.0)
 
     # [v5-NEW] v4g(Gemini) 리뷰 후 조건부 차용
     # - style_reg_weight: std 0.06~0.08 경계 이탈 시 페널티 (v4g 원안 채택)
@@ -823,7 +900,7 @@ def main():
 
     print(f"\n[Dynamic Optimization 구동] 목표 임계치: {threshold}")
     print(f"  speed={speed} | dp_lr_ratio={dp_lr_ratio} | multi_wav_mode={multi_wav_mode}")
-    print(f"  hf_weight={hf_weight} | ltas_weight={ltas_weight} | "
+    print(f"  hf_weight={hf_weight} | ltas_weight={ltas_weight} | low_band_weight={low_band_weight} | "
           f"style_reg={style_reg_weight}(anchor={style_reg_ref_anchor_weight}) | "
           f"mss={mss_loss_weight}(tol={mss_dur_tolerance})"
           + (f" | seq={seq_loss_weight} | dur={dur_loss_weight} | paired_ratio={paired_ratio}"
@@ -897,6 +974,12 @@ def main():
         # [NEW-1] LTAS 양방향 스펙트럼 손실
         if ltas_weight > 0:
             loss = loss + ltas_weight * ltas_loss_fn(gen_wav, current_target_ltas)
+
+        # [v7-NEW] 저역(100-500Hz) 비율 타겟 손실. LTAS 분포 계산을 재사용하므로
+        # 추가 STFT 없이 거의 무비용. "가슴 공명대"만 별도로 붙잡아 LTAS의
+        # 24밴드 평균화로 희석되는 저역 신호를 보강한다.
+        if low_band_weight > 0:
+            loss = loss + low_band_weight * low_band_loss_fn(gen_wav, current_target_ltas)
 
         # [v5-NEW] 페어드 스텝의 duration 오차율 계산 (MSS 게이팅 + dur_loss 공용)
         dur_ratio_err = None
@@ -1015,10 +1098,19 @@ def main():
         if not warmdown_mode and warmdown_gate <= threshold:
             print(f"\n>>> [Phase Transition] EMA(L3) Threshold({threshold}) 도달! "
                   f"(EMA={warmdown_gate:.4f})")
-            print(">>> Dynamic Warm-down 모드 활성화 (LR x0.05, 최대 50스텝 추가 정렬)")
+            print(f">>> Dynamic Warm-down 모드 활성화 "
+                  f"(style_ttl LR x0.05, style_dp LR x{warmdown_dp_lr_scale}, "
+                  f"최대 50스텝 추가 정렬)")
             warmdown_mode = True
-            for pg in optimizer.param_groups:
-                pg['lr'] = pg['lr'] * 0.05
+            # [v6-FIX] style_ttl(index 0)과 style_dp(index 1, train_dp일 때만 존재)를
+            # 구분해서 스케일 적용. style_dp는 warmdown_dp_lr_scale(기본 1.0=유지)로
+            # 별도 조정해, 웜다운 진입 시점에 duration 매칭이 덜 끝났어도 이후
+            # 최대 50스텝 동안 계속 개선될 여지를 남긴다.
+            for gi, pg in enumerate(optimizer.param_groups):
+                if train_dp and gi == 1:
+                    pg['lr'] = pg['lr'] * warmdown_dp_lr_scale
+                else:
+                    pg['lr'] = pg['lr'] * 0.05
             # [v4-NEW] 문서화되어 있었으나 미구현이던 paired_ratio 하향 실제 적용
             if paired_mode and current_paired_ratio > warmdown_paired_ratio:
                 print(f">>> [paired_ratio 하향] {current_paired_ratio:.2f} → "
@@ -1033,11 +1125,38 @@ def main():
 
     # ── 최종 저장 ────────────────────────────────────────────────────────────
     final_path = f"{log_dir}/{name}_final.json"
-    save_style(final_path, best_ttl if best_ttl is not None else style_ttl,
-               best_dp, target_wav_paths)
+    final_ttl_for_save = best_ttl if best_ttl is not None else style_ttl
+    save_style(final_path, final_ttl_for_save, best_dp, target_wav_paths)
+
+    # [v6-NEW] Duration 매칭 사후 검증. welt6에서 음성이 원본보다 최대 25% 길게
+    # 나오는 문제가 dp_lr_ratio 과소 설정으로 발생했음이 사후(음원 직접 청취)에야
+    # 발견되었음. 학습 종료 시점에 각 페어드 타겟에 대해 실제로 합성해 dur 오차를
+    # 직접 측정/리포트하여, 다음부터는 음원을 듣기 전에 로그만으로 이 문제를
+    # 조기에 발견할 수 있게 한다.
+    # [v7-NEW] 같은 forward에서 나온 wav를 재사용해 저역(100-500Hz) 비율 오차도
+    # 함께 실측(추가 forward 없음). welt6에서 "청감상 가볍다"는 문제를 사전에
+    # 로그로 잡기 위함.
+    dur_report = []
+    low_band_report = []
+    if paired_mode:
+        with torch.no_grad():
+            for pi, ((ids, mask), tgt_dur) in enumerate(zip(paired_text_inputs, target_dur_secs)):
+                wav_final, dur_final = tts_forward(
+                    ids, mask, final_ttl_for_save, best_dp,
+                    dp_model, te_model, ve_model, voc_model,
+                    total_step, speed, pr_latents[pi], pr_masks[pi]
+                )
+                dur_natural = (dur_final.squeeze() * speed).item()
+                err_pct = (dur_natural - tgt_dur) / max(tgt_dur, 1e-3) * 100.0
+                dur_report.append((pi, tgt_dur, dur_natural, err_pct))
+
+                gen_ltas_final = compute_ltas_distribution(wav_final.squeeze())
+                gen_low  = low_band_ratio(gen_ltas_final).item()
+                tgt_low  = low_band_ratio(target_ltas_list[pi]).item()
+                low_band_report.append((pi, tgt_low, gen_low))
 
     elapsed = time.time() - start_time
-    final_ttl_std = (best_ttl if best_ttl is not None else style_ttl).detach().std().item()
+    final_ttl_std = final_ttl_for_save.detach().std().item()
     print("\n" + "="*60)
     print("[학습 완료 결과 다차원 평가 리포트]")
     print(f"- 총 학습 소요 시간  : {elapsed:.1f}초 ({elapsed/60:.1f}분)")
@@ -1046,7 +1165,34 @@ def main():
     print(f"- EMA 음색 손실값    : {smoothed_l3:.4f}" if smoothed_l3 is not None else "- EMA 음색 손실값    : N/A")
     print(f"- 최종 style_ttl std : {final_ttl_std:.4f} (정상범위 0.06~0.08)")
     print(f"- 학습 모드          : {'PAIRED' if paired_mode else 'UNPAIRED'}"
-          f" | hf_weight={hf_weight} | ltas_weight={ltas_weight}")
+          f" | hf_weight={hf_weight} | ltas_weight={ltas_weight} | low_band_weight={low_band_weight}")
+    if dur_report:
+        print("-" * 60)
+        print("- Duration 매칭 (원본 발화 길이 대비 오차, 0%에 가까울수록 좋음):")
+        abs_errs = []
+        for pi, tgt_dur, dur_natural, err_pct in dur_report:
+            print(f"    [{pi+1}] 목표 {tgt_dur:.2f}s → 합성 {dur_natural:.2f}s "
+                  f"(오차 {err_pct:+.1f}%)")
+            abs_errs.append(abs(err_pct))
+        mean_abs_err = sum(abs_errs) / len(abs_errs)
+        print(f"  평균 절대 오차: {mean_abs_err:.1f}%")
+        if mean_abs_err > 15.0:
+            print(f"  [경고] duration 오차가 큽니다(>15%). dp_lr_ratio를 올리거나 "
+                  f"(예: 0.01~0.03) warmdown_dp_lr_scale을 1.0 근처로 유지해보세요.")
+    if low_band_report:
+        print("-" * 60)
+        print("- 저역(100-500Hz, 중후함/가슴공명대) 비율 매칭 (원본 대비, %p 단위 오차):")
+        abs_band_errs = []
+        for pi, tgt_low, gen_low in low_band_report:
+            diff_pp = (gen_low - tgt_low) * 100.0
+            print(f"    [{pi+1}] 목표 {tgt_low*100:.1f}% → 합성 {gen_low*100:.1f}% "
+                  f"(오차 {diff_pp:+.1f}%p)")
+            abs_band_errs.append(abs(diff_pp))
+        mean_band_err = sum(abs_band_errs) / len(abs_band_errs)
+        print(f"  평균 절대 오차: {mean_band_err:.1f}%p")
+        if mean_band_err > 5.0:
+            print(f"  [참고] 저역 비율 오차가 5%p를 넘습니다. low_band_weight를 "
+                  f"높여보거나(현재 {low_band_weight}), ltas_weight와의 균형을 재검토해보세요.")
     print("-" * 60)
     if warmdown_mode:
         print("▶ 최종 판정: [✨ 웜다운 방어 수렴 성공]")
