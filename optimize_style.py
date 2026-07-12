@@ -557,10 +557,24 @@ def tts_forward(text_ids, text_mask, style_ttl, style_dp,
     wav = voc_model(xt)
     return wav, dur
 
-def save_style(path, style_ttl, style_dp, source_file=None):
+def save_style(path, style_ttl, style_dp, source_file=None, train_state=None):
     source_meta = (list(source_file)
                    if isinstance(source_file, (list, tuple))
                    else (source_file or "unknown"))
+    metadata = {
+        "source_file":        source_meta,
+        "source_sample_rate": 44100,
+        "target_sample_rate": 44100,
+        "extracted_at":       datetime.now().isoformat()
+    }
+    # [v10-NEW] 재개(resume) 시 EMA(smoothed_l3)와 best_loss가 리셋되어, 재개
+    # 직후 첫 unpaired 샘플 손실이 그대로 초기 EMA가 되면서 "운 좋은 샘플 1개"로
+    # 즉시 웜다운이 발동하는 문제가 실제로 관측됨(welt7: 재개 9스텝만에 웜다운
+    # 진입, duration 오차 21.5%로 재개 세션이 사실상 학습을 못 함). train_state를
+    # 체크포인트에 함께 저장해 재개 시 EMA를 정확히 이어받도록 한다.
+    if train_state is not None:
+        metadata["train_state"] = train_state
+
     style_json = {
         "style_ttl": {
             "data": style_ttl.detach().cpu().numpy().tolist(),
@@ -572,12 +586,7 @@ def save_style(path, style_ttl, style_dp, source_file=None):
             "dims": [1, 8, 16],
             "type": "float32"
         },
-        "metadata": {
-            "source_file":        source_meta,
-            "source_sample_rate": 44100,
-            "target_sample_rate": 44100,
-            "extracted_at":       datetime.now().isoformat()
-        }
+        "metadata": metadata
     }
     dir_part = os.path.dirname(path)
     if dir_part:
@@ -861,11 +870,29 @@ def main():
                                        dtype=torch.float32).to(DEVICE))
 
     # ── 스타일 벡터 초기화 ───────────────────────────────────────────────────
+    # [v10-NEW] 재개 시 학습 상태(EMA/best_loss/paired_ratio)도 함께 복원 시도.
+    # load_voice_style()은 helper.py의 외부 함수라 metadata까지 파싱해준다는
+    # 보장이 없으므로, 체크포인트 JSON을 직접 한 번 더 읽어 train_state만 뽑는다.
+    # 구버전 체크포인트(이 필드가 없던 시절 저장분, 예: welt7_5300.json)는 자동
+    # 폴백 처리되어 None으로 남고, 아래 resume_grace_steps 안전장치가 대신 작동한다.
+    resumed_train_state = None
     if latest_ckpt:
         resumed = load_voice_style(latest_ckpt)
         style_ttl = torch.tensor(resumed.ttl, dtype=torch.float32).to(DEVICE).clone().requires_grad_(True)
         style_dp  = torch.tensor(resumed.dp,  dtype=torch.float32).to(DEVICE).clone().requires_grad_(train_dp)
         print(f"[Resume] style 벡터를 체크포인트에서 복원했습니다.")
+        try:
+            with open(latest_ckpt, "r", encoding="utf-8") as f:
+                _ckpt_raw = json.load(f)
+            resumed_train_state = _ckpt_raw.get("metadata", {}).get("train_state")
+        except Exception:
+            resumed_train_state = None
+        if resumed_train_state:
+            print(f"[Resume] 학습 상태(EMA={resumed_train_state.get('smoothed_l3'):.4f}, "
+                  f"best_loss={resumed_train_state.get('best_loss'):.4f})도 복원했습니다.")
+        else:
+            print(f"[Resume] 이 체크포인트엔 학습 상태 기록이 없습니다(구버전 저장분). "
+                  f"EMA가 새로 형성될 때까지 웜다운 조기 발동 방지용 유예 구간을 적용합니다.")
     else:
         style_ttl = torch.tensor(ref_style.ttl, dtype=torch.float32).to(DEVICE).clone().requires_grad_(True)
         style_dp  = torch.tensor(ref_style.dp,  dtype=torch.float32).to(DEVICE).clone().requires_grad_(train_dp)
@@ -912,6 +939,22 @@ def main():
     # [v4-NEW] EMA 기반 조기종료 지표 + 동적 paired_ratio
     smoothed_l3        = None
     current_paired_ratio = paired_ratio
+
+    # [v10-NEW] 재개 시 학습 상태 복원 (신버전 체크포인트만 해당).
+    # 이걸로 EMA가 재개 직후 첫 몇 샘플만 보고 즉시 웜다운을 발동시키는 문제를
+    # 근본적으로 막는다 — EMA가 "이어지는" 값이므로 재개해도 진짜 대표성 있는
+    # 평균 상태에서 다시 시작한다.
+    if resumed_train_state:
+        smoothed_l3 = resumed_train_state.get("smoothed_l3", None)
+        best_loss   = resumed_train_state.get("best_loss", best_loss)
+        current_paired_ratio = resumed_train_state.get("current_paired_ratio", paired_ratio)
+
+    # [v10-NEW] 구버전 체크포인트(train_state 없음)로 재개할 때의 안전장치.
+    # EMA가 None에서 새로 형성되는 구간에는 웜다운이 발동하지 못하게 유예를 둔다.
+    # 이 유예는 신버전 체크포인트(train_state 복원됨)에는 적용되지 않는다
+    # (이미 정확한 EMA를 이어받았으므로 불필요).
+    resume_grace_steps = cfg.get("resume_grace_steps", 200)
+    needs_resume_grace  = (start_step > 0) and (resumed_train_state is None)
 
     initial_gap = None
     start_time  = time.time()
@@ -1097,14 +1140,25 @@ def main():
                 num_blocks  = min(20, max(0, int(percentage / 5)))
                 bar_str     = "█" * num_blocks + "-" * (20 - num_blocks)
                 gate_label  = "EMA" if smoothed_l3 is not None else "best(EMA 형성전 임시)"
+                grace_note  = ""
+                if needs_resume_grace and (step - start_step < resume_grace_steps):
+                    remaining = resume_grace_steps - (step - start_step)
+                    grace_note = f"  [재개 유예 중: 웜다운 {remaining}스텝 후 판정 시작]"
                 print(f"    [{bar_str}]  {percentage:.1f}%  "
                       f"({gate_label} {progress_gate:.4f} -> 목표 {threshold:.4f}, "
-                      f"gap +{current_gap:.4f})  [참고: best(순간최저) {best_loss:.4f}]")
+                      f"gap +{current_gap:.4f})  [참고: best(순간최저) {best_loss:.4f}]{grace_note}")
 
         # ── 체크포인트 저장 ───────────────────────────────────────────────────
         if (step + 1) % save_every == 0 and best_ttl is not None:
             ckpt_path = f"{log_dir}/{name}_{step+1:04d}.json"
-            save_style(ckpt_path, best_ttl, best_dp, target_wav_paths)
+            # [v10-NEW] EMA/best_loss/paired_ratio를 체크포인트에 함께 저장해
+            # 다음 재개 시 정확히 이어받도록 함 (재개 즉시 조기 웜다운 방지).
+            train_state = {
+                "smoothed_l3": smoothed_l3,
+                "best_loss": best_loss,
+                "current_paired_ratio": current_paired_ratio,
+            }
+            save_style(ckpt_path, best_ttl, best_dp, target_wav_paths, train_state=train_state)
             print(f"  >> Checkpoint saved: {ckpt_path}")
 
         # ── Warmdown ─────────────────────────────────────────────────────────
@@ -1113,7 +1167,12 @@ def main():
         # [FIX-G] 이 값은 위 progress bar의 progress_gate와 완전히 동일한 계산식이다
         # (progress bar는 10스텝마다만 찍히므로 별도 변수로 매 스텝 재계산).
         warmdown_gate = smoothed_l3 if smoothed_l3 is not None else best_loss
-        if not warmdown_mode and warmdown_gate <= threshold:
+        # [v10-NEW] 구버전 체크포인트로 재개해 EMA가 새로 형성 중인 동안은
+        # resume_grace_steps만큼 웜다운 발동을 유예. welt7에서 재개 9스텝만에
+        # (EMA가 첫 몇 샘플만으로 형성되어) 웜다운이 발동, 이후 학습이 사실상
+        # 진행되지 않아 duration 오차가 21.5%까지 방치된 사례의 재발 방지.
+        in_resume_grace = needs_resume_grace and (step - start_step < resume_grace_steps)
+        if not warmdown_mode and warmdown_gate <= threshold and not in_resume_grace:
             print(f"\n>>> [Phase Transition] EMA(L3) Threshold({threshold}) 도달! "
                   f"(EMA={warmdown_gate:.4f})")
             print(f">>> Dynamic Warm-down 모드 활성화 "
@@ -1144,7 +1203,13 @@ def main():
     # ── 최종 저장 ────────────────────────────────────────────────────────────
     final_path = f"{log_dir}/{name}_final.json"
     final_ttl_for_save = best_ttl if best_ttl is not None else style_ttl
-    save_style(final_path, final_ttl_for_save, best_dp, target_wav_paths)
+    final_train_state = {
+        "smoothed_l3": smoothed_l3,
+        "best_loss": best_loss,
+        "current_paired_ratio": current_paired_ratio,
+    }
+    save_style(final_path, final_ttl_for_save, best_dp, target_wav_paths,
+               train_state=final_train_state)
 
     # [v6-NEW] Duration 매칭 사후 검증. welt6에서 음성이 원본보다 최대 25% 길게
     # 나오는 문제가 dp_lr_ratio 과소 설정으로 발생했음이 사후(음원 직접 청취)에야
