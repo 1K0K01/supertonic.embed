@@ -972,6 +972,16 @@ def main():
     # 게이트 필수 조건에서 제외한다(단, 학습/보고에서는 계속 포함됨 — gate만 제외).
     dur_err_stall_baseline = {}   # {pi: (baseline_ema, baseline_step)}
     stalled_items = set()
+    # [v14-NEW] 지금까지 best_dp는 best_ttl과 완전히 같은 조건(timbre primary_loss
+    # 최저점)에서만 스냅샷됐다 — duration 품질은 dp 선택 기준에 전혀 반영 안 됐다.
+    # 즉 timbre가 이른 스텝(예: 1500)에서 최저점을 찍고 그 뒤로 안 움직여도, dp는
+    # num_steps까지 계속 개선되는 것과 무관하게 그 이른 시점의 dp가 저장됐을 것이다
+    # (welt10은 우연히 best_step=7270/8000으로 거의 끝자락이라 문제가 안 드러났을
+    # 뿐, 일반적으로 보장되는 동작이 아니다). style_ttl과 style_dp는 저장 시
+    # 완전히 독립된 필드이므로, 이제 dp는 "가장 안 풀린 항목의 duration EMA가
+    # 최저였던 시점"을 별도로 추적해 그 스냅샷을 최종 저장에 사용한다.
+    best_dur_err          = float('inf')
+    best_dp_for_duration  = None
     current_paired_ratio = paired_ratio
 
     # [v10-NEW] 재개 시 학습 상태 복원 (신버전 체크포인트만 해당).
@@ -988,6 +998,7 @@ def main():
         _raw_baseline = resumed_train_state.get("dur_err_stall_baseline", {}) or {}
         dur_err_stall_baseline = {int(k): tuple(v) for k, v in _raw_baseline.items()}
         best_loss   = resumed_train_state.get("best_loss", best_loss)
+        best_dur_err = resumed_train_state.get("best_dur_err", best_dur_err)
         current_paired_ratio = resumed_train_state.get("current_paired_ratio", paired_ratio)
 
     # [v10-NEW] 구버전 체크포인트(train_state 없음)로 재개할 때의 안전장치.
@@ -1096,9 +1107,32 @@ def main():
             dur_err_ema_per_item[pi] = (dur_ratio_err if prev is None
                                          else early_stop_ema_alpha * dur_ratio_err
                                               + (1 - early_stop_ema_alpha) * prev)
-            # smoothed_dur_err = 지금까지 관측된 항목들 중 가장 안 풀린(최댓값) EMA.
-            # 로그/플롯/체크포인트 하위호환을 위해 필드명은 그대로 유지.
+            # smoothed_dur_err = 지금까지 관측된 항목들 중 가장 안 풀린(최댓값) EMA
+            # (진단/로그/플롯 표시용 — stalled 항목도 포함해 "전체 중 최악"을 보여줌).
             smoothed_dur_err = max(dur_err_ema_per_item.values())
+
+            # [v14_2-FIX] v14 최초 버전은 위 smoothed_dur_err(전체 max, stalled 포함)를
+            # best_dp 선정 기준으로 그대로 썼는데, item[1]처럼 영구 정체된 항목이 있으면
+            # 이 max가 거의 항상 그 항목에 종속돼 실제로는 item2~5의 개선과 무관하게
+            # (item[1] 자체의 미세한 노이즈성 등락만으로) best_dp가 갱신되는 문제가
+            # 있었다. 시뮬레이션 검증: 이 상태에서 마지막 best_dp 갱신 시점이 전체 max
+            # 기준 step 7887, stalled 제외 기준 step 6169로 서로 다르게 나옴 — 전체
+            # max 기준은 "진짜 좋아진 시점"이 아니라 "item[1]이 우연히 살짝 내려간
+            # 시점"을 고를 수 있다는 뜻. 게이트(dur_gate_ok)가 이미 stalled_items를
+            # 제외하고 판정하는 것과 동일한 기준으로 best_dp도 선정하도록 통일한다.
+            _non_stalled_vals = [v for p, v in dur_err_ema_per_item.items()
+                                  if p not in stalled_items]
+            required_dur_metric = max(_non_stalled_vals) if _non_stalled_vals else None
+
+            # [v14-NEW] duration 전용 best dp 스냅샷. dur_gate 오탐 방지 때와 같은
+            # 이유로, 전 항목이 최소 1번씩 관측되기 전엔 갱신하지 않는다(안 그러면
+            # 초반에 우연히 쉬운 항목만 뽑혀 "가짜 best"가 찍힐 수 있음).
+            n_paired_total = len(paired_text_inputs) if paired_text_inputs else 0
+            if (len(dur_err_ema_per_item) >= n_paired_total > 0
+                    and required_dur_metric is not None
+                    and required_dur_metric < best_dur_err):
+                best_dur_err = required_dur_metric
+                best_dp_for_duration = style_dp.detach().clone()
 
             # [v13-NEW] 정체 판정. patience 설정 시에만 동작(하위호환). welt10에서
             # item[1] EMA가 7350스텝 동안 7.46%밖에 개선 안 된 걸 실측 — 구조적
@@ -1244,9 +1278,13 @@ def main():
                 "stalled_items": sorted(stalled_items),
                 "dur_err_stall_baseline": dur_err_stall_baseline,
                 "best_loss": best_loss,
+                "best_dur_err": best_dur_err,
                 "current_paired_ratio": current_paired_ratio,
             }
-            save_style(ckpt_path, best_ttl, best_dp, target_wav_paths, train_state=train_state)
+            # [v14-NEW] duration 전용 best dp가 있으면 그걸 저장, 없으면(dur_gate
+            # 비활성 등) 기존처럼 timbre 기준 best_dp로 폴백 — 하위호환 유지.
+            dp_for_ckpt = best_dp_for_duration if best_dp_for_duration is not None else best_dp
+            save_style(ckpt_path, best_ttl, dp_for_ckpt, target_wav_paths, train_state=train_state)
             print(f"  >> Checkpoint saved: {ckpt_path}")
 
         # ── Warmdown ─────────────────────────────────────────────────────────
@@ -1334,6 +1372,11 @@ def main():
     # ── 최종 저장 ────────────────────────────────────────────────────────────
     final_path = f"{log_dir}/{name}_final.json"
     final_ttl_for_save = best_ttl if best_ttl is not None else style_ttl
+    # [v14-NEW] duration 전용 best dp가 있으면 그걸 최종 저장에 쓴다. 아래 검증
+    # 리포트(다차원 평가 리포트)도 반드시 같은 dp로 합성해야, 리포트에 찍히는
+    # duration/저역 숫자가 "실제로 저장된 체크포인트"와 일치한다 — 그렇지 않으면
+    # 리포트가 저장본과 다른 파라미터를 보여주는 오도(misleading) 상황이 된다.
+    final_dp_for_save = best_dp_for_duration if best_dp_for_duration is not None else best_dp
     final_train_state = {
         "smoothed_l3": smoothed_l3,
         "smoothed_dur_err": smoothed_dur_err,
@@ -1341,9 +1384,10 @@ def main():
         "stalled_items": sorted(stalled_items),
         "dur_err_stall_baseline": dur_err_stall_baseline,
         "best_loss": best_loss,
+        "best_dur_err": best_dur_err,
         "current_paired_ratio": current_paired_ratio,
     }
-    save_style(final_path, final_ttl_for_save, best_dp, target_wav_paths,
+    save_style(final_path, final_ttl_for_save, final_dp_for_save, target_wav_paths,
                train_state=final_train_state)
 
     # [v6-NEW] Duration 매칭 사후 검증. welt6에서 음성이 원본보다 최대 25% 길게
@@ -1360,7 +1404,7 @@ def main():
         with torch.no_grad():
             for pi, ((ids, mask), tgt_dur) in enumerate(zip(paired_text_inputs, target_dur_secs)):
                 wav_final, dur_final = tts_forward(
-                    ids, mask, final_ttl_for_save, best_dp,
+                    ids, mask, final_ttl_for_save, final_dp_for_save,
                     dp_model, te_model, ve_model, voc_model,
                     total_step, speed, pr_latents[pi], pr_masks[pi]
                 )
@@ -1379,7 +1423,15 @@ def main():
     print("[학습 완료 결과 다차원 평가 리포트]")
     print(f"- 총 학습 소요 시간  : {elapsed:.1f}초 ({elapsed/60:.1f}분)")
     print(f"- 최종 학습 진행 스텝: {step + 1} / {num_steps}")
-    print(f"- 최소 음색 손실값   : {best_loss:.4f} (step {best_step} 스냅샷 — 실제로 저장된 체크포인트는 이 시점 파라미터입니다)")
+    print(f"- 최소 음색 손실값   : {best_loss:.4f} (step {best_step} 스냅샷 — style_ttl은 이 시점 파라미터로 저장됩니다)")
+    # [v14-NEW] style_dp는 v14부터 style_ttl과 독립적으로 "duration이 가장 잘 맞았던
+    # 시점"을 따로 추적해 저장한다 — 같은 step이 아닐 수 있음을 명시.
+    if best_dp_for_duration is not None:
+        print(f"- 최소 duration 오차 : EMA {best_dur_err:.4f} 시점 스냅샷 — style_dp는 "
+              f"이 시점 파라미터로 저장됩니다(style_ttl과 다른 step일 수 있음)")
+    else:
+        print(f"- 최소 duration 오차 : 추적 안 됨(페어드 텍스트 없음/dp 미학습) — style_dp는 "
+              f"style_ttl과 같은 시점(음색 최저점) 파라미터로 저장됩니다(v13 이전과 동일)")
     print(f"- EMA 음색 손실값    : {smoothed_l3:.4f}" if smoothed_l3 is not None else "- EMA 음색 손실값    : N/A")
     # [FIX-J] EMA(smoothed_l3)는 "현재(마지막) style_ttl" 기준 실시간 모니터링 값이고,
     # 저장되는 체크포인트는 best_ttl(=best_loss가 나온 step의 스냅샷)이다. 웜다운 꼬리
