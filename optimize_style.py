@@ -1,7 +1,7 @@
 """
-optimize_style_v7.py (v5 기반 — MultiScaleSpectralLoss 버그 수정 + duration/저역 매칭 강화판)
+optimize_style_v14_2.py 
 ─────────────────────────────────────────────────────────────────────────────
-한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드 — v5 기반 v6/v7
+한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드 
 
 v7 수정/신규 사항 (welt6 음향 분석 기반 — "음색은 근접하나 청감상 가볍다" 대응):
   [NEW-4] 저역(100-500Hz, 가슴공명대) 타겟 손실 (low_band_weight)
