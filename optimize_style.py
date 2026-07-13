@@ -1,9 +1,13 @@
 """
-optimize_style_v14_2.py
+optimize_style_v15.py
 ─────────────────────────────────────────────────────────────────────────────
 한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드
 
 신규/수정사항 (누적, 최신순):
+  [v15]   duration 최적 스냅샷의 step 번호(best_dur_step)도 함께 추적/저장하도록
+          추가. 기존엔 EMA 값만 리포트에 찍혀서 몇 스텝에서의 스냅샷인지
+          로그로 역추적할 방법이 없었음 — style_ttl 쪽(best_step)과 동일한
+          형태로 리포트에 표시.
   [v14_2] duration 최적 스냅샷(best_dp_for_duration) 선정 기준에서 정체
           판정된 항목을 제외하도록 수정. 포함 시 정체 항목의 노이즈성 등락에
           선정 시점이 왜곡되는 문제가 있었음(시뮬레이션으로 확인).
@@ -923,6 +927,7 @@ def main():
     # 완전히 독립된 필드이므로, 이제 dp는 "가장 안 풀린 항목의 duration EMA가
     # 최저였던 시점"을 별도로 추적해 그 스냅샷을 최종 저장에 사용한다.
     best_dur_err          = float('inf')
+    best_dur_step         = None
     best_dp_for_duration  = None
     current_paired_ratio = paired_ratio
 
@@ -941,6 +946,7 @@ def main():
         dur_err_stall_baseline = {int(k): tuple(v) for k, v in _raw_baseline.items()}
         best_loss   = resumed_train_state.get("best_loss", best_loss)
         best_dur_err = resumed_train_state.get("best_dur_err", best_dur_err)
+        best_dur_step = resumed_train_state.get("best_dur_step", best_dur_step)
         current_paired_ratio = resumed_train_state.get("current_paired_ratio", paired_ratio)
 
     # [v10-NEW] 구버전 체크포인트(train_state 없음)로 재개할 때의 안전장치.
@@ -1075,6 +1081,7 @@ def main():
                     and required_dur_metric < best_dur_err):
                 best_dur_err = required_dur_metric
                 best_dp_for_duration = style_dp.detach().clone()
+                best_dur_step = step + 1
 
             # [v13-NEW] 정체 판정. patience 설정 시에만 동작(하위호환). 실측 사례에서
             # item[1] EMA가 7350스텝 동안 7.46%밖에 개선 안 된 걸 실측 — 구조적
@@ -1221,6 +1228,7 @@ def main():
                 "dur_err_stall_baseline": dur_err_stall_baseline,
                 "best_loss": best_loss,
                 "best_dur_err": best_dur_err,
+                "best_dur_step": best_dur_step,
                 "current_paired_ratio": current_paired_ratio,
             }
             # [v14-NEW] duration 전용 best dp가 있으면 그걸 저장, 없으면(dur_gate
@@ -1327,6 +1335,7 @@ def main():
         "dur_err_stall_baseline": dur_err_stall_baseline,
         "best_loss": best_loss,
         "best_dur_err": best_dur_err,
+        "best_dur_step": best_dur_step,
         "current_paired_ratio": current_paired_ratio,
     }
     save_style(final_path, final_ttl_for_save, final_dp_for_save, target_wav_paths,
@@ -1369,7 +1378,7 @@ def main():
     # [v14-NEW] style_dp는 v14부터 style_ttl과 독립적으로 "duration이 가장 잘 맞았던
     # 시점"을 따로 추적해 저장한다 — 같은 step이 아닐 수 있음을 명시.
     if best_dp_for_duration is not None:
-        print(f"- 최소 duration 오차 : EMA {best_dur_err:.4f} 시점 스냅샷 — style_dp는 "
+        print(f"- 최소 duration 오차 : EMA {best_dur_err:.4f} (step {best_dur_step} 스냅샷) — style_dp는 "
               f"이 시점 파라미터로 저장됩니다(style_ttl과 다른 step일 수 있음)")
     else:
         print(f"- 최소 duration 오차 : 추적 안 됨(페어드 텍스트 없음/dp 미학습) — style_dp는 "
