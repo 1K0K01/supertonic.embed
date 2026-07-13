@@ -1,107 +1,49 @@
 """
-optimize_style_v14_2.py 
+optimize_style_v14_2.py
 ─────────────────────────────────────────────────────────────────────────────
-한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드 
+한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드
 
-v7 수정/신규 사항 (welt6 음향 분석 기반 — "음색은 근접하나 청감상 가볍다" 대응):
-  [NEW-4] 저역(100-500Hz, 가슴공명대) 타겟 손실 (low_band_weight)
-          F0/spectral centroid median이 원본과 근접해도 청감상 "가볍다"는
-          문제가 실제로 확인됨. LTAS(24밴드 전체 분포) 손실은 gradient가
-          24개 밴드에 분산되어 저역 신호가 상대적으로 약해질 수 있음.
-          compute_ltas_distribution이 이미 계산하는 24밴드 분포에서
-          100-500Hz(인덱스 1~8, 실측 98.2~506.9Hz)의 부분합만 뽑아 그 비율을
-          직접 맞추는 보조 손실 추가. LTAS 계산을 그대로 재사용하므로 추가
-          STFT 없이 거의 무비용 — 학습 속도에 미치는 영향 거의 없음.
-  [NEW-5] 학습 완료 시 저역 비율 매칭 결과를 duration 검증과 함께 실측 리포트.
-          duration 사후 검증에서 이미 호출하는 tts_forward의 wav 출력을
-          재사용(추가 forward 없음)해 저역 오차(%p)까지 같이 보여줌.
-
-v6 수정/신규 사항 (welt6 학습에서 실측된 문제 대응):
-  [FIX-H] dp_lr_ratio 과소 설정 경고
-          effective dp lr = lr * dp_lr_ratio가 너무 작으면(<0.005) style_dp가
-          사실상 학습되지 않아 duration이 어긋난다(welt6에서 최대 +25% 관측).
-          학습 시작 시 즉시 경고.
-  [FIX-I] 웜다운 시 style_dp 그룹 별도 스케일(warmdown_dp_lr_scale, 기본 1.0)
-          기존엔 웜다운이 style_ttl/style_dp 모두 동일하게 x0.05로 낮춰서,
-          duration이 덜 수렴한 상태에서 웜다운에 들어가도 그대로 얼어붙었음.
-          기본값 1.0(안 낮춤)으로 웜다운 구간(+최대 50스텝)에도 dp가 계속
-          개선될 여지를 남김.
-  [NEW-3.5] 학습 완료 시 각 페어드 타겟에 대해 duration 오차를 실측 리포트.
-          음원을 직접 들어보기 전에 로그만으로 duration 문제를 조기 발견 가능.
-
-v5 수정/신규 사항 (v4g[Gemini]가 제안한 3개 기법 검토 후 반영):
-  [ADOPT] style_reg_weight (std 0.06~0.08 경계 페널티)
-          가이드 문서의 진단 기준을 로그 경고에서 실제 loss 항으로 격상.
-          v4g 원안 그대로 채택.
-  [ADOPT-PARTIAL] style_reg_ref_anchor_weight (기본값 0, 비활성)
-          v4g는 초기 레퍼런스 프리셋으로의 L2 앵커를 std 페널티와 함께 항상 켰지만,
-          이는 "레퍼런스에서 타겟 목소리 쪽으로 이동"이라는 학습 목적 자체와
-          상충할 위험이 있어(카일루스 사례처럼 최적점이 초기 프리셋에서 먼 경우)
-          기본 비활성화. 필요 시에만 config로 켤 것.
-  [ADOPT-GATED] mss_loss_weight (Multi-Scale Spectral Loss, 기본값 0)
-          다중 해상도 STFT 손실 자체는 유효한 기법이나, v4g 구현은 길이가 다른
-          파형을 F.interpolate로 강제 정렬해 duration 미수렴 구간(학습 초반)에
-          오정렬 프레임 비교로 인한 노이즈 그래디언트 위험이 있음. dur 오차율이
-          mss_dur_tolerance(기본 0.15) 이내인 페어드 스텝에서만 게이팅 적용하도록
-          안전장치 추가. n_fft/win_length 짝이 잘못 매칭되어(win>n_fft) 학습
-          시작 즉시 RuntimeError로 죽던 버그도 표준 PWG 설정으로 수정.
-  [REJECT] VAD 기반 순수 발화 길이(librosa.effects.split)로 dur_loss 타겟 변경
-          v4g는 문장 내부 모든 무음을 제거한 "순수 유성음 합"을 dur 타겟으로
-          썼으나, 모델이 예측하는 dur은 문장부호에 따른 자연스러운 쉼을 포함한
-          "전체 발화 길이"이므로 의미가 어긋남. 특히 쉼표가 많은 저음 문어체
-          텍스트(가이드 7장)에서는 style_dp가 쉼을 깎아내는 방향으로 왜곡될
-          위험이 있어 채택하지 않음. 기존 librosa.effects.trim(앞뒤 무음만 제거)
-          방식 유지.
-
-v4 수정/신규 사항 (컨텍스트 md의 카일루스 사례 대응):
-  [FIX-D] paired_ratio 웜다운 하향 실제 구현
-          문서(md 3장)에는 "웜다운 진입 시 paired_ratio를 0.3으로 하향"이라고
-          적혀 있었으나 실제 루프에는 반영되어 있지 않았음. warmdown_paired_ratio
-          config로 조절 가능 (기본 0.3).
-  [FIX-E] EMA 기반 조기종료 판정 (카일루스 900스텝 언더핏 사례 원인 대응)
-          기존에는 매 스텝 단일 텍스트의 L3 손실이 threshold 이하이면 즉시
-          웜다운 진입 → 텍스트 난이도 편차로 "운 좋은 샘플 1개"에 조기 락인.
-          smoothed_l3(EMA, early_stop_ema_alpha)로 판정하도록 변경. best 체크
-          포인트 저장 로직(순간 최저값 추적)은 기존 그대로 유지.
-  [FIX-F] ltas_weight 기본값 0.5 → 0.2
-          가이드 문서 자체에 명시된 권장 범위(0.15~0.25)와 기존 기본값이
-          불일치했음. config에 명시하면 그 값이 우선하므로 하위 호환.
-  [NEW-3] style_ttl std 실시간 모니터링 + 정상범위(0.06~0.08) 이탈 경고
-
-v3 수정/신규 사항:
-  [FIX-A] hf_weight를 config에서 읽어 손실 함수에 실제 반영
-          (v2까지는 0.05 하드코딩 — Cell 7/9 파이프라인이 죽은 코드였음)
-  [FIX-B] style_dp gradient 부재 버그 대응:
-          - 페어드 모드(target_texts 제공 시): dur 손실로 진짜 gradient 공급
-          - 언페어드 모드: train_style_dp 자동 비활성화 + 경고 (거짓 동작 제거)
-  [FIX-C] 텍스트별 고정 latent 사전 생성
-          (v2는 텍스트 1번 길이의 latent 하나를 모든 텍스트에 재사용
-           → 장문 압축/단문 늘어짐 → 텍스트 길이 의존 센트로이드 잔차의 원인)
-  [NEW-1] LTAS(장기 평균 스펙트럼) 양방향 매칭 손실 (ltas_weight)
-          - 기존 rfft 억제는 "밝음"만 잡는 단방향. LTAS는 원본의 대역별
-            에너지 분포를 타겟으로 하여 밝음/탁함 양쪽 모두 교정.
-          - 분포 정규화라 텍스트 길이에 불변.
-  [NEW-2] 페어드 텍스트 모드 (target_texts)
-          - 각 WAV의 실제 대사를 합성해 동일 문장끼리 비교
-          - WavLM Layer 6 시퀀스(시간축) 손실로 prosody 감독 (seq_loss_weight)
-          - 원본 발화 길이 vs 예측 dur 손실 (dur_loss_weight) → style_dp 학습
-          - paired_ratio로 페어드/일반 텍스트 혼합 비율 조절
-
-신규 config 키 (모두 선택적, 기본값 有):
-  "target_texts":              ["대사1", "대사2", ...]  # target_wavs와 1:1 순서 대응
-  "hf_weight":                  0.05
-  "ltas_weight":                0.2                      # v4: 기본값 하향
-  "low_band_weight":            0.1                       # v7 신규 (저역 비율 타겟)
-  "seq_loss_weight":            0.3
-  "dur_loss_weight":            0.3
-  "paired_ratio":               0.7
-  "warmdown_paired_ratio":      0.3                      # v4 신규
-  "warmdown_dp_lr_scale":       1.0                       # v6 신규
-  "early_stop_ema_alpha":       0.08                      # v4 신규
-  "style_reg_weight":           0.05                      # v5 신규 (std 경계 페널티)
-  "style_reg_ref_anchor_weight":0.0                       # v5 신규 (기본 꺼짐)
-  "mss_loss_weight":            0.0                       # v5 신규 (기본 꺼짐)
-  "mss_dur_tolerance":          0.15                      # v5 신규
+신규/수정사항 (누적, 최신순):
+  [v14_2] duration 최적 스냅샷(best_dp_for_duration) 선정 기준에서 정체
+          판정된 항목을 제외하도록 수정. 포함 시 정체 항목의 노이즈성 등락에
+          선정 시점이 왜곡되는 문제가 있었음(시뮬레이션으로 확인).
+  [v14]   style_ttl과 style_dp를 서로 다른 기준으로 독립 저장하도록 변경.
+          기존엔 style_dp도 style_ttl과 동일하게 "음색 손실 최저 시점"에만
+          스냅샷됐는데, 그 이후 duration이 계속 개선돼도 저장본에 전혀
+          반영되지 않는 문제가 있었음. 이제 "가장 안 풀린 항목의 duration이
+          최저였던 시점"을 별도 추적해 저장. 학습 종료 시 실측 검증 리포트도
+          실제 저장되는 dp로 합성하도록 통일.
+  [v13]   웜다운 duration 게이트에 "정체(stall) 판정" 추가. 특정 항목이 일정
+          스텝 동안 충분히 개선되지 않으면(아직 tolerance 초과 상태일 때만)
+          게이트 필수조건에서 제외 — 구조적으로 안 풀리는 항목 하나 때문에
+          나머지가 다 풀렸는데도 전체 스텝 예산을 낭비하는 것을 방지.
+  [v12]   웜다운 duration 게이트가 페어드 항목 각각을 독립된 EMA로 추적하도록
+          변경. 이전엔 단일 pooled EMA만 써서, 특정 항목이 안 풀렸어도 최근
+          샘플링 운으로 게이트가 잘못 통과될 확률이 유의미하게 높았음
+          (몬테카를로 시뮬레이션으로 확인).
+  [v11]   웜다운이 음색(WavLM) EMA만 보고 판정되던 것에, duration EMA도 별도
+          tolerance 이내여야 통과하는 게이트를 추가. 학습 로그에 EMA(dur_err)
+          필드 추가, loss curve 그래프에도 보조축으로 함께 표시.
+  [v10]   재개(resume) 시 EMA/best_loss/paired_ratio 상태를 체크포인트에서
+          복원하도록 수정 — 이전엔 재개 직후 EMA가 새로 형성되며 조기 웜다운이
+          발동할 위험이 있었음. 안전장치로 resume_grace_steps 추가.
+  [v9]    웜다운 진입 후에도 EMA가 다시 threshold를 넘는 경우를 감지해 최종
+          판정 문구를 구분 표시. 저장되는 체크포인트가 best 스냅샷임을 리포트에
+          명시.
+  [v8]    학습 종료 시 페어드 타겟별 duration/저역 오차를 실측해 리포트.
+  [v7]    저역(100-500Hz) 비율 타겟 손실(low_band_weight) 추가. LTAS 손실만으론
+          저역 신호가 여러 밴드에 분산되어 상대적으로 약해지는 문제 대응.
+  [v6]    effective dp lr(=lr×dp_lr_ratio)이 지나치게 작으면 style_dp가 사실상
+          학습되지 않아 duration이 어긋나는 문제 경고 추가. 웜다운 시 style_dp
+          그룹 LR을 style_ttl과 별도 스케일(warmdown_dp_lr_scale)로 조절 가능.
+  [v5]    style_reg_weight(std 경계 페널티), Multi-Scale Spectral Loss(안전
+          게이팅 포함) 추가.
+  [v4]    웜다운 판정을 단일 스텝 손실이 아닌 EMA 기준으로 변경(우연히 쉬운
+          샘플 하나로 조기 락인되는 문제 방지). 문서화만 되어있고 미구현이던
+          웜다운 시 paired_ratio 하향을 실제로 반영.
+  [v3]    style_dp 그래디언트가 실제로 흐르지 않던 버그 수정(언페어드 모드에선
+          자동 비활성화). 텍스트별 고정 latent 사전 생성(길이 의존 잔차 제거).
+          LTAS 양방향 매칭 손실 추가.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -254,7 +196,7 @@ def auto_select_preset_by_texture(wavlm, tts, target_feats_avg):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1b. [v5-NEW] Multi-Scale Spectral Loss (v4g 검토 후 게이팅 조건부 차용)
+# 1b. [v5-NEW] Multi-Scale Spectral Loss (게이팅 조건부 적용)
 #     페어드 스텝에서 생성 파형 vs 원본 파형을 직접 다중 해상도 STFT로 비교.
 #     주의: 길이가 다르면 F.interpolate로 시간축을 강제 정렬하는데, 이는 DTW가
 #     아닌 단순 선형 리샘플이라 duration이 크게 어긋난 상태(학습 초반, style_dp
@@ -450,7 +392,7 @@ def ltas_loss_fn(gen_wav, target_ltas):
 
 # [v7-NEW] 저역(중후함/가슴공명대) 타겟 손실.
 # ─────────────────────────────────────────────────────────────────────────────
-# welt6 음향 분석에서 F0/centroid는 원본과 근접했지만 실제 청취 시 "가볍다"는
+# 음향 분석에서 F0/centroid는 원본과 근접했지만 실제 청취 시 "가볍다"는
 # 인상이 확인됨. 원인 분석 결과 centroid(가중평균 하나의 스칼라)는 저역 비율의
 # 미세한 변화나 음량 차이로 인한 청감 효과를 못 잡는다는 게 확인됨. LTAS 손실
 # (24밴드 로그분포 L1)은 전체 분포 형태를 맞추려 하지만, 24개 밴드에 걸쳐
@@ -569,7 +511,7 @@ def save_style(path, style_ttl, style_dp, source_file=None, train_state=None):
     }
     # [v10-NEW] 재개(resume) 시 EMA(smoothed_l3)와 best_loss가 리셋되어, 재개
     # 직후 첫 unpaired 샘플 손실이 그대로 초기 EMA가 되면서 "운 좋은 샘플 1개"로
-    # 즉시 웜다운이 발동하는 문제가 실제로 관측됨(welt7: 재개 9스텝만에 웜다운
+    # 즉시 웜다운이 발동하는 문제가 실제로 관측됨(재개 직후 9스텝만에 웜다운
     # 진입, duration 오차 21.5%로 재개 세션이 사실상 학습을 못 함). train_state를
     # 체크포인트에 함께 저장해 재개 시 EMA를 정확히 이어받도록 한다.
     if train_state is not None:
@@ -680,7 +622,7 @@ def main():
     speed         = cfg.get("speed", 0.95)
     save_every    = cfg.get("save_every", 100)
     threshold     = cfg.get("early_stop_loss_threshold", 0.18)
-    # [v11-NEW] welt8 사례: dp_lr_ratio가 이미 권장 범위(0.03)여도, 타겟 blend가
+    # [v11-NEW] dp_lr_ratio가 이미 권장 범위(0.03)여도, 타겟 blend가
     # 좋아 style_ttl(음색) EMA가 duration보다 훨씬 빨리 threshold에 도달하면
     # 웜다운이 먼저 걸려 style_dp가 전체 num_steps 예산을 다 못 쓰고 조기 종료됨
     # (실측: 8000 예산 중 3693 스텝에서 종료, duration 평균 오차 21.3%로 방치).
@@ -693,7 +635,7 @@ def main():
     dur_gate_stall_min_improvement = cfg.get("dur_gate_stall_min_improvement", 0.05)
     use_ecapa     = cfg.get("use_ecapa_loss", True)
     # [v6-NEW] dp_lr_ratio가 지나치게 작으면 style_dp가 사실상 학습되지 않아
-    # duration(발화 길이) 매칭이 실패한다. welt6 학습에서 dp_lr_ratio=0.001로
+    # duration(발화 길이) 매칭이 실패한다. dp_lr_ratio=0.001로 설정했던 사례에서
     # effective lr이 1e-7대까지 떨어져 합성 음성이 원본보다 최대 25% 길어지는
     # 문제가 실제로 관측되어 경고를 추가한다.
     _DP_LR_RATIO_WARN_THRESHOLD = 0.005
@@ -705,7 +647,7 @@ def main():
     ecapa_weight  = cfg.get("ecapa_loss_weight", 0.3)
 
     # [FIX-A] hf_weight config 연동 + 신규 손실 가중치들
-    # [v4] ltas_weight 기본값을 0.5→0.2로 조정: 가이드 문서(9장 카일루스 교훈)에서
+    # [v4] ltas_weight 기본값을 0.5→0.2로 조정: 가이드 문서(9장)에서
     #      0.5는 과도한 저음 유도로 먹먹함을 유발한다고 자체 확인됨. 명시적으로
     #      config에 값을 넣으면 그 값이 우선하므로 기존 실험 재현성은 유지됨.
     hf_weight       = cfg.get("hf_weight", 0.05)
@@ -728,20 +670,20 @@ def main():
     # 기존 버그: 웜다운이 모든 param_group(style_ttl, style_dp)의 LR을 동일하게
     # x0.05로 낮췄는데, style_dp는 이미 dp_lr_ratio로 낮게 잡혀 있어 웜다운
     # 진입 시점에 duration 매칭이 아직 안 끝났어도 그대로 사실상 동결되어버림
-    # (welt6에서 합성이 원본보다 최대 25% 길어진 원인). 기본값 1.0 = 웜다운 때도
+    # (합성이 원본보다 최대 25% 길어지는 원인이 된 사례가 있었음). 기본값 1.0 = 웜다운 때도
     # style_dp는 낮추지 않고 style_ttl만 낮춰서, duration이 웜다운 구간
     # (+최대 50스텝)에서도 계속 개선될 여지를 남긴다.
     warmdown_dp_lr_scale = cfg.get("warmdown_dp_lr_scale", 1.0)
 
-    # [v5-NEW] v4g(Gemini) 리뷰 후 조건부 차용
-    # - style_reg_weight: std 0.06~0.08 경계 이탈 시 페널티 (v4g 원안 채택)
+    # [v5-NEW] 검토 후 조건부 적용
+    # - style_reg_weight: std 0.06~0.08 경계 이탈 시 페널티
     # - style_reg_ref_anchor_weight: 초기 레퍼런스로의 L2 앵커. 기본 0(끔).
-    #   최적점이 레퍼런스에서 먼 경우(카일루스 사례처럼) 매칭을 방해할 수 있어
+    #   최적점이 레퍼런스에서 먼 경우 매칭을 방해할 수 있어
     #   기본 비활성화 — 과적합/스타일 발산이 실제로 관측될 때만 켤 것.
     style_reg_weight            = cfg.get("style_reg_weight", 0.05)
     style_reg_ref_anchor_weight = cfg.get("style_reg_ref_anchor_weight", 0.0)
     # - mss_loss_weight: Multi-Scale Spectral Loss. 기본 0(끔). duration이
-    #   mss_dur_tolerance 이내로 수렴한 페어드 스텝에서만 게이팅 적용(v4g 원안엔
+    #   mss_dur_tolerance 이내로 수렴한 페어드 스텝에서만 게이팅 적용(원래는
     #   없던 안전장치 — 초반 duration 미수렴 구간의 오정렬 프레임 비교 방지).
     mss_loss_weight   = cfg.get("mss_loss_weight", 0.0)
     mss_dur_tolerance = cfg.get("mss_dur_tolerance", 0.15)
@@ -884,7 +826,7 @@ def main():
     # [v10-NEW] 재개 시 학습 상태(EMA/best_loss/paired_ratio)도 함께 복원 시도.
     # load_voice_style()은 helper.py의 외부 함수라 metadata까지 파싱해준다는
     # 보장이 없으므로, 체크포인트 JSON을 직접 한 번 더 읽어 train_state만 뽑는다.
-    # 구버전 체크포인트(이 필드가 없던 시절 저장분, 예: welt7_5300.json)는 자동
+    # 구버전 체크포인트(이 필드가 없던 시절 저장분)는 자동
     # 폴백 처리되어 None으로 남고, 아래 resume_grace_steps 안전장치가 대신 작동한다.
     resumed_train_state = None
     if latest_ckpt:
@@ -951,7 +893,7 @@ def main():
     # [v4-NEW] EMA 기반 조기종료 지표 + 동적 paired_ratio
     smoothed_l3        = None
     # [v11-NEW] duration EMA — 아래 dur_gate_tolerance 설명 참고.
-    # [v12-FIX] welt10 실측: item[1]이 45.9% 오차로 전혀 안 풀렸는데도 855스텝만에
+    # [v12-FIX] 실측 사례: 특정 항목이 45.9% 오차로 전혀 안 풀렸는데도 855스텝만에
     # 웜다운이 발동함. 원인 확인(몬테카를로 시뮬레이션): pi가 매 페어드 스텝마다
     # random.randrange(5)로 균등 샘플링되고 EMA alpha=0.08(유효 기억 폭 ~12.5
     # 페어드 스텝)이라, "최근에 우연히 쉬운 항목만 뽑히는 스트릭"만으로 pooled EMA가
@@ -962,7 +904,7 @@ def main():
     # 평균"이 아니라 "5개 항목 중 가장 안 풀린 항목의 EMA"를 담는다.
     smoothed_dur_err   = None
     dur_err_ema_per_item = {}   # {pi: EMA} — 항목별 개별 추적
-    # [v13-NEW] welt10 실측: item[1](가장 빠른 원본 발화)의 duration EMA가
+    # [v13-NEW] 실측 사례: 가장 빠른 원본 발화에 해당하는 항목의 duration EMA가
     # 0.4653(step 10) -> 0.4306(step 7360)로, 7350스텝 동안 누적 개선률이 겨우
     # 7.46%에 불과했다(선형 외삽해도 0.19 도달까지 수만 스텝 이상 필요 — 사실상
     # 도달 불가능한 구조적 한계로 판단). "모든 항목이 tolerance를 만족해야 함"
@@ -976,7 +918,7 @@ def main():
     # 최저점)에서만 스냅샷됐다 — duration 품질은 dp 선택 기준에 전혀 반영 안 됐다.
     # 즉 timbre가 이른 스텝(예: 1500)에서 최저점을 찍고 그 뒤로 안 움직여도, dp는
     # num_steps까지 계속 개선되는 것과 무관하게 그 이른 시점의 dp가 저장됐을 것이다
-    # (welt10은 우연히 best_step=7270/8000으로 거의 끝자락이라 문제가 안 드러났을
+    # (어떤 사례는 우연히 best_step이 전체 스텝의 끝자락이라 문제가 안 드러났을
     # 뿐, 일반적으로 보장되는 동작이 아니다). style_ttl과 style_dp는 저장 시
     # 완전히 독립된 필드이므로, 이제 dp는 "가장 안 풀린 항목의 duration EMA가
     # 최저였던 시점"을 별도로 추적해 그 스냅샷을 최종 저장에 사용한다.
@@ -1134,7 +1076,7 @@ def main():
                 best_dur_err = required_dur_metric
                 best_dp_for_duration = style_dp.detach().clone()
 
-            # [v13-NEW] 정체 판정. patience 설정 시에만 동작(하위호환). welt10에서
+            # [v13-NEW] 정체 판정. patience 설정 시에만 동작(하위호환). 실측 사례에서
             # item[1] EMA가 7350스텝 동안 7.46%밖에 개선 안 된 걸 실측 — 구조적
             # outlier 항목 하나 때문에 나머지가 다 풀렸어도 num_steps 전체를
             # 낭비하는 걸 방지.
@@ -1166,7 +1108,7 @@ def main():
                         / max(current_dur_target, 1e-3)) ** 2
             loss = loss + dur_loss_weight * dur_loss.mean()
 
-        # [v5-NEW] Multi-Scale Spectral Loss — v4g(Gemini) 리뷰 후 게이팅 조건부 차용.
+        # [v5-NEW] Multi-Scale Spectral Loss — 게이팅 조건부 적용.
         # duration이 아직 크게 어긋난 상태(학습 초반/dp 미수렴)에서는 STFT 프레임
         # 정렬 자체가 부정확해 노이즈 그래디언트가 될 수 있어, 오차율이
         # mss_dur_tolerance 이내로 수렴했을 때만 활성화한다.
@@ -1174,10 +1116,10 @@ def main():
                 and dur_ratio_err is not None and dur_ratio_err <= mss_dur_tolerance):
             loss = loss + mss_loss_weight * mss_loss_fn(gen_wav, target_wav_ts[pi])
 
-        # [v5-NEW] Style 정규화 (v4g 리뷰 후 조건부 차용)
+        # [v5-NEW] Style 정규화 (조건부 적용)
         # - std 경계(0.06~0.08) 페널티: 가이드 문서 진단 기준을 실제 loss로 반영 (채택)
         # - 레퍼런스 앵커 L2: 기본 가중치 0으로 비활성화. 최적점이 초기 레퍼런스
-        #   프리셋에서 먼 경우(카일루스 사례) 매칭을 방해할 위험이 있어 필요할 때만
+        #   프리셋에서 먼 경우 매칭을 방해할 위험이 있어 필요할 때만
         #   style_reg_ref_anchor_weight를 config에서 켜서 사용할 것.
         if style_reg_weight > 0:
             current_std = style_ttl.std()
@@ -1209,7 +1151,7 @@ def main():
         # ── Best 갱신 (일반 텍스트 스텝 기준 — 페어드는 분포가 달라 제외) ──
         if not use_paired:
             # [v4-NEW] EMA는 스텝별 노이즈를 평활해 "운 좋은 샘플 1개"로
-            # 웜다운이 조기 발동하는 것을 방지 (카일루스 900스텝 언더핏 사례 대응)
+            # 웜다운이 조기 발동하는 것을 방지 (학습 초반 조기 언더핏 사례 대응)
             smoothed_l3 = (primary_loss if smoothed_l3 is None
                            else early_stop_ema_alpha * primary_loss
                                 + (1 - early_stop_ema_alpha) * smoothed_l3)
@@ -1293,11 +1235,11 @@ def main():
         # [FIX-G] 이 값은 위 progress bar의 progress_gate와 완전히 동일한 계산식이다
         # (progress bar는 10스텝마다만 찍히므로 별도 변수로 매 스텝 재계산).
         warmdown_gate = smoothed_l3 if smoothed_l3 is not None else best_loss
-        # [v12-FIX] welt10 실측: item[1]이 45.9% 오차로 안 풀렸는데도 855스텝만에
+        # [v12-FIX] 실측 사례: 특정 항목이 45.9% 오차로 안 풀렸는데도 855스텝만에
         # 웜다운 발동(원인: pooled EMA가 최근 샘플링 운으로 왜곡, 몬테카를로 검증상
         # 45% 확률로 오탐 가능했음). 이제 (a) 5개 항목 전부 최소 1번씩은 샘플링돼
         # 있어야 하고 (b) 그중 가장 안 풀린 항목의 EMA도 tolerance 이내여야 통과.
-        # [v13-FIX] welt10 재실측: item[1]이 7350스텝 동안 7.46%밖에 개선 안 됨
+        # [v13-FIX] 실측 사례: 특정 항목이 7350스텝 동안 7.46%밖에 개선 안 됨
         # (구조적 outlier). "전부 만족" 규칙 그대로면 나머지 4개가 다 풀려도
         # num_steps 전체를 낭비함. stalled_items로 판정된 항목은 이 요구조건에서
         # 제외(단, 정체 판정 자체가 꺼져 있으면 stalled_items는 항상 비어 있어
@@ -1315,7 +1257,7 @@ def main():
             or required_items_ok
         )
         # [v10-NEW] 구버전 체크포인트로 재개해 EMA가 새로 형성 중인 동안은
-        # resume_grace_steps만큼 웜다운 발동을 유예. welt7에서 재개 9스텝만에
+        # resume_grace_steps만큼 웜다운 발동을 유예. 재개 직후 9스텝만에
         # (EMA가 첫 몇 샘플만으로 형성되어) 웜다운이 발동, 이후 학습이 사실상
         # 진행되지 않아 duration 오차가 21.5%까지 방치된 사례의 재발 방지.
         in_resume_grace = needs_resume_grace and (step - start_step < resume_grace_steps)
@@ -1390,13 +1332,13 @@ def main():
     save_style(final_path, final_ttl_for_save, final_dp_for_save, target_wav_paths,
                train_state=final_train_state)
 
-    # [v6-NEW] Duration 매칭 사후 검증. welt6에서 음성이 원본보다 최대 25% 길게
+    # [v6-NEW] Duration 매칭 사후 검증. 합성 음성이 원본보다 최대 25% 길게
     # 나오는 문제가 dp_lr_ratio 과소 설정으로 발생했음이 사후(음원 직접 청취)에야
     # 발견되었음. 학습 종료 시점에 각 페어드 타겟에 대해 실제로 합성해 dur 오차를
     # 직접 측정/리포트하여, 다음부터는 음원을 듣기 전에 로그만으로 이 문제를
     # 조기에 발견할 수 있게 한다.
     # [v7-NEW] 같은 forward에서 나온 wav를 재사용해 저역(100-500Hz) 비율 오차도
-    # 함께 실측(추가 forward 없음). welt6에서 "청감상 가볍다"는 문제를 사전에
+    # 함께 실측(추가 forward 없음). "청감상 가볍다"는 문제를 사전에
     # 로그로 잡기 위함.
     dur_report = []
     low_band_report = []
