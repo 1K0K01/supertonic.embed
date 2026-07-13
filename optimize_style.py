@@ -687,6 +687,10 @@ def main():
     # None(기본값)이면 기존과 동일하게 음색 EMA만으로 판정(하위 호환). 값을
     # 넣으면(예: 0.15) duration EMA도 이 오차율 이내여야 웜다운이 걸림.
     dur_gate_tolerance = cfg.get("early_stop_dur_gate_tolerance", None)
+    # [v13-NEW] 정체 판정 파라미터. patience=None이면 정체 판정 자체를 끔(하위호환 —
+    # v12와 동일하게 모든 항목이 무조건 tolerance를 만족해야 함).
+    dur_gate_stall_patience_steps  = cfg.get("dur_gate_stall_patience_steps", None)
+    dur_gate_stall_min_improvement = cfg.get("dur_gate_stall_min_improvement", 0.05)
     use_ecapa     = cfg.get("use_ecapa_loss", True)
     # [v6-NEW] dp_lr_ratio가 지나치게 작으면 style_dp가 사실상 학습되지 않아
     # duration(발화 길이) 매칭이 실패한다. welt6 학습에서 dp_lr_ratio=0.001로
@@ -958,6 +962,16 @@ def main():
     # 평균"이 아니라 "5개 항목 중 가장 안 풀린 항목의 EMA"를 담는다.
     smoothed_dur_err   = None
     dur_err_ema_per_item = {}   # {pi: EMA} — 항목별 개별 추적
+    # [v13-NEW] welt10 실측: item[1](가장 빠른 원본 발화)의 duration EMA가
+    # 0.4653(step 10) -> 0.4306(step 7360)로, 7350스텝 동안 누적 개선률이 겨우
+    # 7.46%에 불과했다(선형 외삽해도 0.19 도달까지 수만 스텝 이상 필요 — 사실상
+    # 도달 불가능한 구조적 한계로 판단). "모든 항목이 tolerance를 만족해야 함"
+    # 규칙은 이런 구조적 outlier 항목이 하나만 있어도 나머지 4개가 이미 다 풀렸는데도
+    # num_steps 예산을 통째로 낭비하게 만든다. stall_patience_steps 이상 지났는데
+    # stall_min_improvement 이상 개선이 없는 항목은 "정체(stalled)"로 판정해
+    # 게이트 필수 조건에서 제외한다(단, 학습/보고에서는 계속 포함됨 — gate만 제외).
+    dur_err_stall_baseline = {}   # {pi: (baseline_ema, baseline_step)}
+    stalled_items = set()
     current_paired_ratio = paired_ratio
 
     # [v10-NEW] 재개 시 학습 상태 복원 (신버전 체크포인트만 해당).
@@ -970,6 +984,9 @@ def main():
         dur_err_ema_per_item = resumed_train_state.get("dur_err_ema_per_item", {}) or {}
         # JSON은 dict key를 문자열로 저장하므로 정수 pi로 되돌린다.
         dur_err_ema_per_item = {int(k): v for k, v in dur_err_ema_per_item.items()}
+        stalled_items = set(resumed_train_state.get("stalled_items", []) or [])
+        _raw_baseline = resumed_train_state.get("dur_err_stall_baseline", {}) or {}
+        dur_err_stall_baseline = {int(k): tuple(v) for k, v in _raw_baseline.items()}
         best_loss   = resumed_train_state.get("best_loss", best_loss)
         current_paired_ratio = resumed_train_state.get("current_paired_ratio", paired_ratio)
 
@@ -1082,6 +1099,32 @@ def main():
             # smoothed_dur_err = 지금까지 관측된 항목들 중 가장 안 풀린(최댓값) EMA.
             # 로그/플롯/체크포인트 하위호환을 위해 필드명은 그대로 유지.
             smoothed_dur_err = max(dur_err_ema_per_item.values())
+
+            # [v13-NEW] 정체 판정. patience 설정 시에만 동작(하위호환). welt10에서
+            # item[1] EMA가 7350스텝 동안 7.46%밖에 개선 안 된 걸 실측 — 구조적
+            # outlier 항목 하나 때문에 나머지가 다 풀렸어도 num_steps 전체를
+            # 낭비하는 걸 방지.
+            if dur_gate_stall_patience_steps is not None and pi not in stalled_items:
+                if pi not in dur_err_stall_baseline:
+                    dur_err_stall_baseline[pi] = (dur_err_ema_per_item[pi], step)
+                else:
+                    base_val, base_step = dur_err_stall_baseline[pi]
+                    if (step - base_step) >= dur_gate_stall_patience_steps:
+                        rel_improve = ((base_val - dur_err_ema_per_item[pi])
+                                        / max(base_val, 1e-6))
+                        # 이미 tolerance 이내로 수렴한 항목은 "정체"라고 부를 필요가
+                        # 없다 (그냥 다 풀려서 개선폭이 작아진 것뿐) — tolerance
+                        # 초과 상태에서 개선이 없을 때만 진짜 "정체"로 판정한다.
+                        still_over_tolerance = (dur_err_ema_per_item[pi] > dur_gate_tolerance)
+                        if rel_improve < dur_gate_stall_min_improvement and still_over_tolerance:
+                            stalled_items.add(pi)
+                            print(f"    [정체 판정] 항목[{pi+1}] duration EMA가 "
+                                  f"{dur_gate_stall_patience_steps}스텝 동안 "
+                                  f"{rel_improve*100:.1f}%밖에 개선 안 됨(기준 "
+                                  f"{dur_gate_stall_min_improvement*100:.0f}%). "
+                                  f"웜다운 게이트 필수조건에서 제외(학습은 계속됨).")
+                        else:
+                            dur_err_stall_baseline[pi] = (dur_err_ema_per_item[pi], step)
 
         # [FIX-B] 페어드 dur 손실 → style_dp에 실제 gradient 공급
         if use_paired and train_dp and style_dp.requires_grad and dur_loss_weight > 0:
@@ -1198,6 +1241,8 @@ def main():
                 "smoothed_l3": smoothed_l3,
                 "smoothed_dur_err": smoothed_dur_err,
                 "dur_err_ema_per_item": dur_err_ema_per_item,
+                "stalled_items": sorted(stalled_items),
+                "dur_err_stall_baseline": dur_err_stall_baseline,
                 "best_loss": best_loss,
                 "current_paired_ratio": current_paired_ratio,
             }
@@ -1210,24 +1255,26 @@ def main():
         # [FIX-G] 이 값은 위 progress bar의 progress_gate와 완전히 동일한 계산식이다
         # (progress bar는 10스텝마다만 찍히므로 별도 변수로 매 스텝 재계산).
         warmdown_gate = smoothed_l3 if smoothed_l3 is not None else best_loss
-        # [v11-NEW] duration 게이트. welt8에서 style_ttl(음색) EMA만으로 판정하다
-        # style_dp가 num_steps 예산의 46%만 쓰고 조기 종료되어 duration 오차가
-        # 평균 21.3%(최대 +47.7%)까지 방치된 사례 재발 방지. dur_gate_tolerance가
-        # 설정되지 않았거나(None) 아직 paired 스텝이 없어 EMA가 없으면(dp 미학습
-        # 모드 등) 기존처럼 통과시켜 하위 호환 유지.
         # [v12-FIX] welt10 실측: item[1]이 45.9% 오차로 안 풀렸는데도 855스텝만에
         # 웜다운 발동(원인: pooled EMA가 최근 샘플링 운으로 왜곡, 몬테카를로 검증상
         # 45% 확률로 오탐 가능했음). 이제 (a) 5개 항목 전부 최소 1번씩은 샘플링돼
         # 있어야 하고 (b) 그중 가장 안 풀린 항목의 EMA도 tolerance 이내여야 통과.
-        all_items_covered = (
-            not paired_mode or not paired_text_inputs
-            or len(dur_err_ema_per_item) >= len(paired_text_inputs)
-        )
+        # [v13-FIX] welt10 재실측: item[1]이 7350스텝 동안 7.46%밖에 개선 안 됨
+        # (구조적 outlier). "전부 만족" 규칙 그대로면 나머지 4개가 다 풀려도
+        # num_steps 전체를 낭비함. stalled_items로 판정된 항목은 이 요구조건에서
+        # 제외(단, 정체 판정 자체가 꺼져 있으면 stalled_items는 항상 비어 있어
+        # v12와 동일하게 동작 — 하위호환).
+        n_total_items = len(paired_text_inputs) if paired_text_inputs else 0
+        required_items_ok = all(
+            (pi in stalled_items)
+            or (pi in dur_err_ema_per_item and dur_err_ema_per_item[pi] <= dur_gate_tolerance)
+            for pi in range(n_total_items)
+        ) if (dur_gate_tolerance is not None and n_total_items > 0) else True
         dur_gate_ok = (
             dur_gate_tolerance is None
             or not train_dp
             or smoothed_dur_err is None
-            or (all_items_covered and smoothed_dur_err <= dur_gate_tolerance)
+            or required_items_ok
         )
         # [v10-NEW] 구버전 체크포인트로 재개해 EMA가 새로 형성 중인 동안은
         # resume_grace_steps만큼 웜다운 발동을 유예. welt7에서 재개 9스텝만에
@@ -1237,17 +1284,25 @@ def main():
         if not warmdown_mode and warmdown_gate <= threshold and not in_resume_grace:
             if not dur_gate_ok:
                 if (step + 1) % 10 == 0:
-                    if not all_items_covered:
-                        n_seen = len(dur_err_ema_per_item)
-                        n_total = len(paired_text_inputs) if paired_text_inputs else 0
+                    n_total = len(paired_text_inputs) if paired_text_inputs else 0
+                    uncovered = [pi for pi in range(n_total)
+                                 if pi not in stalled_items and pi not in dur_err_ema_per_item]
+                    if uncovered:
                         print(f"    [duration 게이트 대기] 음색 EMA는 threshold 도달했지만 "
-                              f"아직 페어드 항목 {n_seen}/{n_total}개만 관측돼 웜다운을 유예합니다.")
+                              f"아직 페어드 항목 {n_total - len(uncovered)}/{n_total}개만 "
+                              f"관측돼 웜다운을 유예합니다.")
                     else:
-                        worst_pi = max(dur_err_ema_per_item, key=dur_err_ema_per_item.get)
+                        # 필수 항목(정체 판정 안 된 것들) 중 가장 안 풀린 것을 보고
+                        required = {pi: v for pi, v in dur_err_ema_per_item.items()
+                                    if pi not in stalled_items}
+                        worst_pi = max(required, key=required.get)
+                        stall_note = (f" (정체 제외된 항목: "
+                                      f"{sorted(p+1 for p in stalled_items)})"
+                                      if stalled_items else "")
                         print(f"    [duration 게이트 대기] 음색 EMA는 threshold 도달했지만 "
                               f"가장 안 풀린 항목[{worst_pi+1}]의 duration EMA"
-                              f"({smoothed_dur_err:.3f})가 목표({dur_gate_tolerance:.3f}) "
-                              f"이내가 아니라 웜다운을 유예합니다.")
+                              f"({required[worst_pi]:.3f})가 목표({dur_gate_tolerance:.3f}) "
+                              f"이내가 아니라 웜다운을 유예합니다.{stall_note}")
             else:
                 print(f"\n>>> [Phase Transition] EMA(L3) Threshold({threshold}) 도달! "
                       f"(EMA={warmdown_gate:.4f})")
@@ -1283,6 +1338,8 @@ def main():
         "smoothed_l3": smoothed_l3,
         "smoothed_dur_err": smoothed_dur_err,
         "dur_err_ema_per_item": dur_err_ema_per_item,
+        "stalled_items": sorted(stalled_items),
+        "dur_err_stall_baseline": dur_err_stall_baseline,
         "best_loss": best_loss,
         "current_paired_ratio": current_paired_ratio,
     }
@@ -1354,6 +1411,10 @@ def main():
         if mean_abs_err > 15.0:
             print(f"  [경고] duration 오차가 큽니다(>15%). dp_lr_ratio를 올리거나 "
                   f"(예: 0.01~0.03) warmdown_dp_lr_scale을 1.0 근처로 유지해보세요.")
+        if stalled_items:
+            print(f"  [참고] 항목 {sorted(p+1 for p in stalled_items)}은(는) duration 게이트 "
+                  f"진행 중 '정체'로 판정되어 웜다운 필수조건에서 제외됐습니다 — "
+                  f"구조적으로 더 학습해도 잘 안 줄어드는 항목일 가능성이 있습니다.")
     if low_band_report:
         print("-" * 60)
         print("- 저역(100-500Hz, 중후함/가슴공명대) 비율 매칭 (원본 대비, %p 단위 오차):")
