@@ -680,6 +680,13 @@ def main():
     speed         = cfg.get("speed", 0.95)
     save_every    = cfg.get("save_every", 100)
     threshold     = cfg.get("early_stop_loss_threshold", 0.18)
+    # [v11-NEW] welt8 사례: dp_lr_ratio가 이미 권장 범위(0.03)여도, 타겟 blend가
+    # 좋아 style_ttl(음색) EMA가 duration보다 훨씬 빨리 threshold에 도달하면
+    # 웜다운이 먼저 걸려 style_dp가 전체 num_steps 예산을 다 못 쓰고 조기 종료됨
+    # (실측: 8000 예산 중 3693 스텝에서 종료, duration 평균 오차 21.3%로 방치).
+    # None(기본값)이면 기존과 동일하게 음색 EMA만으로 판정(하위 호환). 값을
+    # 넣으면(예: 0.15) duration EMA도 이 오차율 이내여야 웜다운이 걸림.
+    dur_gate_tolerance = cfg.get("early_stop_dur_gate_tolerance", None)
     use_ecapa     = cfg.get("use_ecapa_loss", True)
     # [v6-NEW] dp_lr_ratio가 지나치게 작으면 style_dp가 사실상 학습되지 않아
     # duration(발화 길이) 매칭이 실패한다. welt6 학습에서 dp_lr_ratio=0.001로
@@ -931,6 +938,7 @@ def main():
 
     best_loss      = float('inf')
     best_ttl       = None
+    best_step      = None
     best_dp        = style_dp.detach().clone()
     warmdown_mode  = False
     warmdown_steps = 0
@@ -938,6 +946,18 @@ def main():
 
     # [v4-NEW] EMA 기반 조기종료 지표 + 동적 paired_ratio
     smoothed_l3        = None
+    # [v11-NEW] duration EMA — 아래 dur_gate_tolerance 설명 참고.
+    # [v12-FIX] welt10 실측: item[1]이 45.9% 오차로 전혀 안 풀렸는데도 855스텝만에
+    # 웜다운이 발동함. 원인 확인(몬테카를로 시뮬레이션): pi가 매 페어드 스텝마다
+    # random.randrange(5)로 균등 샘플링되고 EMA alpha=0.08(유효 기억 폭 ~12.5
+    # 페어드 스텝)이라, "최근에 우연히 쉬운 항목만 뽑히는 스트릭"만으로 pooled EMA가
+    # tolerance 밑으로 떨어질 확률이 45%(!)에 달함 — 사실상 동전 던지기 수준으로
+    # 게이트가 속을 수 있었음. 항목별로 따로 EMA를 추적해 "가장 안 풀린 항목"
+    # 기준으로 게이트를 걸면 이 오탐이 시뮬레이션상 0%로 떨어짐(검증 완료).
+    # smoothed_dur_err는 하위호환/로그용으로 유지하되, 이제부터 그 값은 "pooled
+    # 평균"이 아니라 "5개 항목 중 가장 안 풀린 항목의 EMA"를 담는다.
+    smoothed_dur_err   = None
+    dur_err_ema_per_item = {}   # {pi: EMA} — 항목별 개별 추적
     current_paired_ratio = paired_ratio
 
     # [v10-NEW] 재개 시 학습 상태 복원 (신버전 체크포인트만 해당).
@@ -946,6 +966,10 @@ def main():
     # 평균 상태에서 다시 시작한다.
     if resumed_train_state:
         smoothed_l3 = resumed_train_state.get("smoothed_l3", None)
+        smoothed_dur_err = resumed_train_state.get("smoothed_dur_err", None)
+        dur_err_ema_per_item = resumed_train_state.get("dur_err_ema_per_item", {}) or {}
+        # JSON은 dict key를 문자열로 저장하므로 정수 pi로 되돌린다.
+        dur_err_ema_per_item = {int(k): v for k, v in dur_err_ema_per_item.items()}
         best_loss   = resumed_train_state.get("best_loss", best_loss)
         current_paired_ratio = resumed_train_state.get("current_paired_ratio", paired_ratio)
 
@@ -1048,6 +1072,16 @@ def main():
             dur_natural   = dur.squeeze() * speed  # speed로 나눈 값을 원속도로 환원
             dur_ratio_err = (torch.abs(dur_natural - current_dur_target)
                               / max(current_dur_target, 1e-3)).item()
+            # [v12-FIX] pooled EMA 대신 항목별(pi) EMA를 따로 갱신. dur_gate_tolerance가
+            # 설정된 경우 "가장 안 풀린 항목" 기준으로 웜다운을 판정해, 특정 항목이
+            # 계속 안 풀렸는데도 최근 샘플링 운으로 게이트가 통과되는 문제를 막는다.
+            prev = dur_err_ema_per_item.get(pi)
+            dur_err_ema_per_item[pi] = (dur_ratio_err if prev is None
+                                         else early_stop_ema_alpha * dur_ratio_err
+                                              + (1 - early_stop_ema_alpha) * prev)
+            # smoothed_dur_err = 지금까지 관측된 항목들 중 가장 안 풀린(최댓값) EMA.
+            # 로그/플롯/체크포인트 하위호환을 위해 필드명은 그대로 유지.
+            smoothed_dur_err = max(dur_err_ema_per_item.values())
 
         # [FIX-B] 페어드 dur 손실 → style_dp에 실제 gradient 공급
         if use_paired and train_dp and style_dp.requires_grad and dur_loss_weight > 0:
@@ -1106,20 +1140,27 @@ def main():
             best_loss = primary_loss
             best_ttl  = style_ttl.detach().clone()
             best_dp   = style_dp.detach().clone()
+            best_step = step + 1
         elif use_paired and best_ttl is None:
             # 초반 전부 페어드일 때 best 미설정 방지
             best_ttl = style_ttl.detach().clone()
             best_dp  = style_dp.detach().clone()
+            best_step = step + 1
 
         # ── 로그 출력 (Cell 10 파싱 정규식 호환 포맷 고정) ────────────────────
         if (step + 1) % 10 == 0:
             current_lr = optimizer.param_groups[0]['lr']
             ttl_std    = style_ttl.detach().std().item()
             ema_str    = f"{smoothed_l3:.4f}" if smoothed_l3 is not None else "N/A"
+            # [v11-NEW] EMA(dur_err)는 기존 정규식이 찾는 마지막 캡처그룹(EMA(L3))
+            # 뒤에 덧붙인다. 정규식이 문자열 끝(`$`)에 고정되어 있지 않고
+            # `re.search`로 부분 매치하므로, 뒤에 필드를 추가해도 기존 Cell 10
+            # 파싱은 영향받지 않는다(검증: 아래 self-test 참고).
+            dur_ema_str = (f"{smoothed_dur_err:.4f}" if smoothed_dur_err is not None else "N/A")
             print(f"  Step {step+1}/{num_steps} | Loss(total): {loss.item():.4f} | "
                   f"Loss(L3): {primary_loss:.4f} | LR: {current_lr:.5f} | "
                   f"Best(L3): {best_loss:.4f} | EMA(L3): {ema_str} | "
-                  f"ttl_std: {ttl_std:.4f}")
+                  f"ttl_std: {ttl_std:.4f} | EMA(dur_err): {dur_ema_str}")
             if ttl_std > 0.09 or ttl_std < 0.05:
                 print(f"    [주의] style_ttl std({ttl_std:.4f})가 정상 범위(0.06~0.08) 밖입니다. "
                       f"과적합/붕괴 가능성 — lr 또는 threshold 재검토 권장.")
@@ -1155,6 +1196,8 @@ def main():
             # 다음 재개 시 정확히 이어받도록 함 (재개 즉시 조기 웜다운 방지).
             train_state = {
                 "smoothed_l3": smoothed_l3,
+                "smoothed_dur_err": smoothed_dur_err,
+                "dur_err_ema_per_item": dur_err_ema_per_item,
                 "best_loss": best_loss,
                 "current_paired_ratio": current_paired_ratio,
             }
@@ -1167,32 +1210,65 @@ def main():
         # [FIX-G] 이 값은 위 progress bar의 progress_gate와 완전히 동일한 계산식이다
         # (progress bar는 10스텝마다만 찍히므로 별도 변수로 매 스텝 재계산).
         warmdown_gate = smoothed_l3 if smoothed_l3 is not None else best_loss
+        # [v11-NEW] duration 게이트. welt8에서 style_ttl(음색) EMA만으로 판정하다
+        # style_dp가 num_steps 예산의 46%만 쓰고 조기 종료되어 duration 오차가
+        # 평균 21.3%(최대 +47.7%)까지 방치된 사례 재발 방지. dur_gate_tolerance가
+        # 설정되지 않았거나(None) 아직 paired 스텝이 없어 EMA가 없으면(dp 미학습
+        # 모드 등) 기존처럼 통과시켜 하위 호환 유지.
+        # [v12-FIX] welt10 실측: item[1]이 45.9% 오차로 안 풀렸는데도 855스텝만에
+        # 웜다운 발동(원인: pooled EMA가 최근 샘플링 운으로 왜곡, 몬테카를로 검증상
+        # 45% 확률로 오탐 가능했음). 이제 (a) 5개 항목 전부 최소 1번씩은 샘플링돼
+        # 있어야 하고 (b) 그중 가장 안 풀린 항목의 EMA도 tolerance 이내여야 통과.
+        all_items_covered = (
+            not paired_mode or not paired_text_inputs
+            or len(dur_err_ema_per_item) >= len(paired_text_inputs)
+        )
+        dur_gate_ok = (
+            dur_gate_tolerance is None
+            or not train_dp
+            or smoothed_dur_err is None
+            or (all_items_covered and smoothed_dur_err <= dur_gate_tolerance)
+        )
         # [v10-NEW] 구버전 체크포인트로 재개해 EMA가 새로 형성 중인 동안은
         # resume_grace_steps만큼 웜다운 발동을 유예. welt7에서 재개 9스텝만에
         # (EMA가 첫 몇 샘플만으로 형성되어) 웜다운이 발동, 이후 학습이 사실상
         # 진행되지 않아 duration 오차가 21.5%까지 방치된 사례의 재발 방지.
         in_resume_grace = needs_resume_grace and (step - start_step < resume_grace_steps)
         if not warmdown_mode and warmdown_gate <= threshold and not in_resume_grace:
-            print(f"\n>>> [Phase Transition] EMA(L3) Threshold({threshold}) 도달! "
-                  f"(EMA={warmdown_gate:.4f})")
-            print(f">>> Dynamic Warm-down 모드 활성화 "
-                  f"(style_ttl LR x0.05, style_dp LR x{warmdown_dp_lr_scale}, "
-                  f"최대 50스텝 추가 정렬)")
-            warmdown_mode = True
-            # [v6-FIX] style_ttl(index 0)과 style_dp(index 1, train_dp일 때만 존재)를
-            # 구분해서 스케일 적용. style_dp는 warmdown_dp_lr_scale(기본 1.0=유지)로
-            # 별도 조정해, 웜다운 진입 시점에 duration 매칭이 덜 끝났어도 이후
-            # 최대 50스텝 동안 계속 개선될 여지를 남긴다.
-            for gi, pg in enumerate(optimizer.param_groups):
-                if train_dp and gi == 1:
-                    pg['lr'] = pg['lr'] * warmdown_dp_lr_scale
-                else:
-                    pg['lr'] = pg['lr'] * 0.05
-            # [v4-NEW] 문서화되어 있었으나 미구현이던 paired_ratio 하향 실제 적용
-            if paired_mode and current_paired_ratio > warmdown_paired_ratio:
-                print(f">>> [paired_ratio 하향] {current_paired_ratio:.2f} → "
-                      f"{warmdown_paired_ratio:.2f} (페어드 과적합 방지)")
-                current_paired_ratio = warmdown_paired_ratio
+            if not dur_gate_ok:
+                if (step + 1) % 10 == 0:
+                    if not all_items_covered:
+                        n_seen = len(dur_err_ema_per_item)
+                        n_total = len(paired_text_inputs) if paired_text_inputs else 0
+                        print(f"    [duration 게이트 대기] 음색 EMA는 threshold 도달했지만 "
+                              f"아직 페어드 항목 {n_seen}/{n_total}개만 관측돼 웜다운을 유예합니다.")
+                    else:
+                        worst_pi = max(dur_err_ema_per_item, key=dur_err_ema_per_item.get)
+                        print(f"    [duration 게이트 대기] 음색 EMA는 threshold 도달했지만 "
+                              f"가장 안 풀린 항목[{worst_pi+1}]의 duration EMA"
+                              f"({smoothed_dur_err:.3f})가 목표({dur_gate_tolerance:.3f}) "
+                              f"이내가 아니라 웜다운을 유예합니다.")
+            else:
+                print(f"\n>>> [Phase Transition] EMA(L3) Threshold({threshold}) 도달! "
+                      f"(EMA={warmdown_gate:.4f})")
+                print(f">>> Dynamic Warm-down 모드 활성화 "
+                      f"(style_ttl LR x0.05, style_dp LR x{warmdown_dp_lr_scale}, "
+                      f"최대 50스텝 추가 정렬)")
+                warmdown_mode = True
+                # [v6-FIX] style_ttl(index 0)과 style_dp(index 1, train_dp일 때만 존재)를
+                # 구분해서 스케일 적용. style_dp는 warmdown_dp_lr_scale(기본 1.0=유지)로
+                # 별도 조정해, 웜다운 진입 시점에 duration 매칭이 덜 끝났어도 이후
+                # 최대 50스텝 동안 계속 개선될 여지를 남긴다.
+                for gi, pg in enumerate(optimizer.param_groups):
+                    if train_dp and gi == 1:
+                        pg['lr'] = pg['lr'] * warmdown_dp_lr_scale
+                    else:
+                        pg['lr'] = pg['lr'] * 0.05
+                # [v4-NEW] 문서화되어 있었으나 미구현이던 paired_ratio 하향 실제 적용
+                if paired_mode and current_paired_ratio > warmdown_paired_ratio:
+                    print(f">>> [paired_ratio 하향] {current_paired_ratio:.2f} → "
+                          f"{warmdown_paired_ratio:.2f} (페어드 과적합 방지)")
+                    current_paired_ratio = warmdown_paired_ratio
 
         if warmdown_mode:
             warmdown_steps += 1
@@ -1205,6 +1281,8 @@ def main():
     final_ttl_for_save = best_ttl if best_ttl is not None else style_ttl
     final_train_state = {
         "smoothed_l3": smoothed_l3,
+        "smoothed_dur_err": smoothed_dur_err,
+        "dur_err_ema_per_item": dur_err_ema_per_item,
         "best_loss": best_loss,
         "current_paired_ratio": current_paired_ratio,
     }
@@ -1244,8 +1322,22 @@ def main():
     print("[학습 완료 결과 다차원 평가 리포트]")
     print(f"- 총 학습 소요 시간  : {elapsed:.1f}초 ({elapsed/60:.1f}분)")
     print(f"- 최종 학습 진행 스텝: {step + 1} / {num_steps}")
-    print(f"- 최소 음색 손실값   : {best_loss:.4f}")
+    print(f"- 최소 음색 손실값   : {best_loss:.4f} (step {best_step} 스냅샷 — 실제로 저장된 체크포인트는 이 시점 파라미터입니다)")
     print(f"- EMA 음색 손실값    : {smoothed_l3:.4f}" if smoothed_l3 is not None else "- EMA 음색 손실값    : N/A")
+    # [FIX-J] EMA(smoothed_l3)는 "현재(마지막) style_ttl" 기준 실시간 모니터링 값이고,
+    # 저장되는 체크포인트는 best_ttl(=best_loss가 나온 step의 스냅샷)이다. 웜다운 꼬리
+    # 구간에서 unpaired 텍스트 난이도 편차로 EMA가 threshold 위로 다시 튀는 경우,
+    # "성공" 판정과 "EMA가 threshold를 넘었다"는 로그가 동시에 찍혀 혼란을 준다.
+    # → 두 값이 서로 다른 파라미터 상태를 가리킨다는 점을 명시적으로 경고.
+    ema_drifted_above_threshold = (
+        warmdown_mode and smoothed_l3 is not None and smoothed_l3 > threshold
+    )
+    if ema_drifted_above_threshold:
+        print(f"  [참고] 최종 EMA({smoothed_l3:.4f})가 threshold({threshold:.4f})보다 높습니다. "
+              f"이는 웜다운 꼬리 구간(unpaired 샘플 편차)에서 '현재' 파라미터 기준 "
+              f"모니터링 값이 흔들린 것으로, 실제 저장된 체크포인트(best_ttl, step "
+              f"{best_step}, loss {best_loss:.4f})와는 다른 상태를 가리킵니다. "
+              f"음원 품질 자체보다는 리포트 해석 문제일 가능성이 높습니다.")
     print(f"- 최종 style_ttl std : {final_ttl_std:.4f} (정상범위 0.06~0.08)")
     print(f"- 학습 모드          : {'PAIRED' if paired_mode else 'UNPAIRED'}"
           f" | hf_weight={hf_weight} | ltas_weight={ltas_weight} | low_band_weight={low_band_weight}")
@@ -1277,7 +1369,10 @@ def main():
             print(f"  [참고] 저역 비율 오차가 5%p를 넘습니다. low_band_weight를 "
                   f"높여보거나(현재 {low_band_weight}), ltas_weight와의 균형을 재검토해보세요.")
     print("-" * 60)
-    if warmdown_mode:
+    if warmdown_mode and ema_drifted_above_threshold:
+        print("▶ 최종 판정: [⚠️ 웜다운 진입했으나 종료 시점 EMA가 threshold 재초과 — "
+              "저장본은 best 스냅샷 사용됨, 음원 직접 청취로 재확인 권장]")
+    elif warmdown_mode:
         print("▶ 최종 판정: [✨ 웜다운 방어 수렴 성공]")
     else:
         print("▶ 최종 판정: [✅ 만기 완주 수렴]")
