@@ -4,6 +4,18 @@ optimize_style_v15.py
 한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드
 
 신규/수정사항 (누적, 최신순):
+  [v16]   페어드 항목(pi) 선택에 opt-in weighted 모드 추가
+          (config: paired_sampling_mode="uniform"|"weighted", sampling_explore_ratio).
+          기존엔 매 페어드 스텝마다 5개 항목을 완전 균등 샘플링해서, 이미 잘 맞은
+          항목과 안 맞은 항목에 동일한 그래디언트 예산을 썼다. weighted 모드는
+          duration EMA + 저역(low-band) EMA가 큰 항목에 샘플링 확률을 더 배정한다
+          (정체 판정된 항목은 낮은 가중치로 유지, 완전 배제는 안 함). 저역 비율
+          오차도 duration과 동일하게 항목별 EMA로 추적하도록 신규 추가— 로그에
+          EMA(low_err) 필드, 최종 리포트에 항목별 EMA 진단 노트 추가. LTAS 분포
+          계산도 ltas_loss/low_band_loss/EMA 추적이 각각 재계산하던 걸 스텝당
+          1회로 통합(rfft 중복 제거). 기본값(uniform)에서는 기존과 100% 동일하게
+          동작 — select_paired_index()의 단위 시뮬레이션으로 검증(본문 코드 하단
+          self-test 참고).
   [v15]   duration 최적 스냅샷의 step 번호(best_dur_step)도 함께 추적/저장하도록
           추가. 기존엔 EMA 값만 리포트에 찍혀서 몇 스텝에서의 스냅샷인지
           로그로 역추적할 방법이 없었음 — style_ttl 쪽(best_step)과 동일한
@@ -387,11 +399,14 @@ def compute_ltas_distribution(wav, sr=44100):
     dist = torch.stack(bands)
     return dist / (dist.sum() + 1e-10)
 
-def ltas_loss_fn(gen_wav, target_ltas):
-    """log 분포 L1 — 원본 대비 밝음(+)/탁함(-) 양방향 모두 패널티."""
-    gen_ltas = compute_ltas_distribution(gen_wav)
+def ltas_loss_from_dist(gen_ltas, target_ltas):
+    """[v16-NEW] log 분포 L1. gen_ltas를 이미 계산해둔 경우 rfft 재계산 없이 사용."""
     return F.l1_loss(torch.log10(gen_ltas + 1e-8),
                      torch.log10(target_ltas + 1e-8))
+
+def ltas_loss_fn(gen_wav, target_ltas):
+    """log 분포 L1 — 원본 대비 밝음(+)/탁함(-) 양방향 모두 패널티."""
+    return ltas_loss_from_dist(compute_ltas_distribution(gen_wav), target_ltas)
 
 
 # [v7-NEW] 저역(중후함/가슴공명대) 타겟 손실.
@@ -411,12 +426,17 @@ def low_band_ratio(ltas_dist):
     """[N_LTAS_BANDS] 정규화 분포 → 저역(100-500Hz) 에너지 비율 스칼라."""
     return ltas_dist[LOW_BAND_IDX].sum()
 
+def low_band_loss_from_dist(gen_ltas, target_ltas):
+    """[v16-NEW] gen_ltas를 이미 계산해둔 경우 재사용. (loss, gen_low, tgt_low) 반환 —
+    gen_low/tgt_low는 항목별 저역 오차 EMA 추적 및 weighted 샘플링에도 재사용된다."""
+    gen_low = low_band_ratio(gen_ltas)
+    tgt_low = low_band_ratio(target_ltas)
+    return F.mse_loss(gen_low, tgt_low), gen_low, tgt_low
+
 def low_band_loss_fn(gen_wav, target_ltas):
     """생성 음성과 타겟의 저역 비율 차이를 직접 패널티. LTAS 분포를 재사용."""
-    gen_ltas = compute_ltas_distribution(gen_wav)
-    gen_low  = low_band_ratio(gen_ltas)
-    tgt_low  = low_band_ratio(target_ltas)
-    return F.mse_loss(gen_low, tgt_low)
+    loss, _, _ = low_band_loss_from_dist(compute_ltas_distribution(gen_wav), target_ltas)
+    return loss
 
 
 def wavlm_primary_loss(wavlm, gen_wav, target_features, layer=3):
@@ -589,6 +609,82 @@ def build_per_text_latents(text_inputs, ref_style, dp_model, tts, speed, seed):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# [v16-NEW] 페어드 항목 샘플링 (uniform vs weighted)
+# ─────────────────────────────────────────────────────────────────────────────
+# 배경(welt12~welt14 실측): 저역(100-500Hz) 비율 오차가 item마다 반대 방향으로
+# 벌어짐(예: item[1]은 저역 부족(-), item[2]는 저역 과다(+)). style_ttl은 5개
+# 페어드 텍스트가 공유하는 단일 벡터라, low_band_weight를 아무리 올려도 상충하는
+# 두 방향을 동시에 만족시킬 수 없고 압력만 세지는 현상이 4번의 학습(low_band_weight
+# 0.1/0.12, dp_lr_ratio 0.045/0.06)에서 반복 확인됨. 기존 `random.randrange`
+# 균등 샘플링은 이미 잘 맞은 항목과 안 맞은 항목에 매 스텝 동일한 그래디언트
+# 예산을 쓰므로, 안 풀린 항목에 상대적으로 더 많은 스텝을 배정하는 실험용 옵션을
+# 추가한다(opt-in, 기본은 기존과 동일한 uniform).
+def select_paired_index(
+    n_items, dur_err_ema, low_band_err_ema, stalled_items,
+    mode="uniform", explore_ratio=0.2, stalled_weight=0.3, rng=None
+):
+    """다음 페어드 스텝에서 학습할 항목 인덱스를 고른다.
+
+    mode="uniform": 기존과 완전히 동일한 random.randrange(n_items) 동작
+                     (하위 호환, 기본값).
+    mode="weighted": 아직 한 번도 관측 안 된 항목이 있으면 그 항목을 우선
+                     선택(coverage-first, 초반 EMA 형성 보장). 이후에는
+                     explore_ratio 확률로 무작위 탐색을 섞고, 나머지 확률은
+                     "duration EMA + 저역 EMA를 각각 항목 평균으로 정규화해
+                     합산한 가중치"에 비례해 선택한다. dur_gate에서 이미
+                     정체(stalled)로 판정된 항목은 stalled_weight로 낮춰서
+                     완전히 배제하진 않되(재정체 여부 재확인 여지는 남김)
+                     예산을 과도하게 뺏기지 않게 한다.
+
+    rng: random.Random 인스턴스(테스트/시뮬레이션에서 결정론적 검증을 위해
+         주입 가능). None이면 전역 random 모듈 사용.
+    """
+    _r = rng if rng is not None else random
+
+    if mode != "weighted":
+        return _r.randrange(n_items)
+
+    dur_err_ema = dur_err_ema or {}
+    low_band_err_ema = low_band_err_ema or {}
+    stalled_items = stalled_items or set()
+
+    unobserved = [i for i in range(n_items)
+                  if i not in dur_err_ema and i not in low_band_err_ema]
+    if unobserved:
+        return _r.choice(unobserved)
+
+    if _r.random() < explore_ratio:
+        return _r.randrange(n_items)
+
+    dur_vals = [dur_err_ema.get(i) for i in range(n_items)]
+    low_vals = [low_band_err_ema.get(i) for i in range(n_items)]
+    dur_obs  = [v for v in dur_vals if v is not None]
+    low_obs  = [v for v in low_vals if v is not None]
+    dur_mean = (sum(dur_obs) / len(dur_obs)) if dur_obs else 1.0
+    low_mean = (sum(low_obs) / len(low_obs)) if low_obs else 1.0
+    dur_mean = dur_mean if dur_mean > 1e-6 else 1.0
+    low_mean = low_mean if low_mean > 1e-6 else 1.0
+
+    weights = []
+    for i in range(n_items):
+        if i in stalled_items:
+            weights.append(stalled_weight)
+            continue
+        dn = (dur_vals[i] / dur_mean) if dur_vals[i] is not None else 1.0
+        ln = (low_vals[i] / low_mean) if low_vals[i] is not None else 1.0
+        weights.append(max(0.05, 0.5 * dn + 0.5 * ln))
+
+    total = sum(weights)
+    threshold_r = _r.random() * total
+    acc = 0.0
+    for i, w in enumerate(weights):
+        acc += w
+        if threshold_r <= acc:
+            return i
+    return n_items - 1  # 부동소수점 오차로 못 걸릴 경우의 폴백
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8. 메인 최적화 루프
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -664,6 +760,15 @@ def main():
     seq_loss_weight = cfg.get("seq_loss_weight", 0.3)
     dur_loss_weight = cfg.get("dur_loss_weight", 0.3)
     paired_ratio    = cfg.get("paired_ratio", 0.7)
+    # [v16-NEW] 페어드 항목(pi) 선택 방식. "uniform"(기본, 기존과 완전 동일 동작)
+    # | "weighted"(실험적, opt-in): 아직 tolerance를 못 채운/오차가 큰 항목에
+    # 상대적으로 더 많은 스텝을 배정. select_paired_index() 참고.
+    paired_sampling_mode  = cfg.get("paired_sampling_mode", "uniform")
+    sampling_explore_ratio = cfg.get("sampling_explore_ratio", 0.2)
+    if paired_sampling_mode not in ("uniform", "weighted"):
+        print(f"[경고] paired_sampling_mode='{paired_sampling_mode}'는 알 수 없는 값입니다. "
+              f"'uniform'으로 폴백합니다.")
+        paired_sampling_mode = "uniform"
     # [v4-NEW] 웜다운 진입 시 하향할 paired_ratio 상한 (문서에는 있었으나
     # 실제 루프에 미반영이었던 기능을 구현)
     warmdown_paired_ratio = cfg.get("warmdown_paired_ratio", 0.3)
@@ -908,6 +1013,12 @@ def main():
     # 평균"이 아니라 "5개 항목 중 가장 안 풀린 항목의 EMA"를 담는다.
     smoothed_dur_err   = None
     dur_err_ema_per_item = {}   # {pi: EMA} — 항목별 개별 추적
+    # [v16-NEW] 저역(low-band) 비율 오차도 duration과 동일한 방식으로 항목별
+    # EMA(절대 %p)를 추적. weighted 샘플링의 입력이자, 로그/최종 리포트에서
+    # "학습 내내 특정 항목만 저역이 안 맞았는지"를 진단하는 데 쓰인다. 값 자체가
+    # 웜다운 게이트 판정에는 아직 관여하지 않는다(기존 duration 게이트 동작을
+    # 바꾸지 않기 위한 의도적 스코프 제한 — 필요해지면 별도 tolerance로 확장).
+    low_band_err_ema_per_item = {}   # {pi: EMA(|gen-tgt|*100, %p 단위)}
     # [v13-NEW] 실측 사례: 가장 빠른 원본 발화에 해당하는 항목의 duration EMA가
     # 0.4653(step 10) -> 0.4306(step 7360)로, 7350스텝 동안 누적 개선률이 겨우
     # 7.46%에 불과했다(선형 외삽해도 0.19 도달까지 수만 스텝 이상 필요 — 사실상
@@ -941,6 +1052,10 @@ def main():
         dur_err_ema_per_item = resumed_train_state.get("dur_err_ema_per_item", {}) or {}
         # JSON은 dict key를 문자열로 저장하므로 정수 pi로 되돌린다.
         dur_err_ema_per_item = {int(k): v for k, v in dur_err_ema_per_item.items()}
+        # [v16-NEW] 구버전 체크포인트(이 필드 없음)로 재개해도 그냥 빈 dict로
+        # 시작 — weighted 샘플링은 coverage-first 로직이 있어 안전하게 재형성됨.
+        low_band_err_ema_per_item = resumed_train_state.get("low_band_err_ema_per_item", {}) or {}
+        low_band_err_ema_per_item = {int(k): v for k, v in low_band_err_ema_per_item.items()}
         stalled_items = set(resumed_train_state.get("stalled_items", []) or [])
         _raw_baseline = resumed_train_state.get("dur_err_stall_baseline", {}) or {}
         dur_err_stall_baseline = {int(k): tuple(v) for k, v in _raw_baseline.items()}
@@ -965,6 +1080,8 @@ def main():
           f"style_reg={style_reg_weight}(anchor={style_reg_ref_anchor_weight}) | "
           f"mss={mss_loss_weight}(tol={mss_dur_tolerance})"
           + (f" | seq={seq_loss_weight} | dur={dur_loss_weight} | paired_ratio={paired_ratio}"
+             f" | paired_sampling={paired_sampling_mode}"
+             + (f"(explore={sampling_explore_ratio})" if paired_sampling_mode == "weighted" else "")
              if paired_mode else ""))
     print(f"  학습 구간: step {start_step + 1} → {num_steps}\n")
 
@@ -982,7 +1099,14 @@ def main():
         use_paired = (paired_mode and random.random() < current_paired_ratio)
 
         if use_paired:
-            pi = random.randrange(len(paired_text_inputs))
+            # [v16-NEW] paired_sampling_mode="uniform"(기본)이면
+            # random.randrange(len(paired_text_inputs))와 완전히 동일하게 동작
+            # (select_paired_index 내부에서 mode!="weighted"면 그대로 위임).
+            pi = select_paired_index(
+                len(paired_text_inputs), dur_err_ema_per_item, low_band_err_ema_per_item,
+                stalled_items, mode=paired_sampling_mode,
+                explore_ratio=sampling_explore_ratio
+            )
             text_ids, text_mask   = paired_text_inputs[pi]
             noisy_latent, l_mask  = pr_latents[pi], pr_masks[pi]
             current_target_feats  = target_feats_list[pi]
@@ -1032,15 +1156,30 @@ def main():
             seq_loss_weight=seq_loss_weight
         )
 
+        # [v16-NEW] LTAS 분포는 rfft가 들어가는 연산이라, ltas_loss/low_band_loss/
+        # 항목별 저역 EMA 추적(weighted 샘플링용)이 각자 다시 계산하면 스텝당 최대
+        # 2회 중복 호출됐다. 이번에 한 번만 계산해 전부 재사용하도록 통합.
+        need_ltas_dist = (ltas_weight > 0 or low_band_weight > 0
+                           or (use_paired and paired_sampling_mode == "weighted"))
+        gen_ltas = compute_ltas_distribution(gen_wav) if need_ltas_dist else None
+
         # [NEW-1] LTAS 양방향 스펙트럼 손실
         if ltas_weight > 0:
-            loss = loss + ltas_weight * ltas_loss_fn(gen_wav, current_target_ltas)
+            loss = loss + ltas_weight * ltas_loss_from_dist(gen_ltas, current_target_ltas)
 
         # [v7-NEW] 저역(100-500Hz) 비율 타겟 손실. LTAS 분포 계산을 재사용하므로
         # 추가 STFT 없이 거의 무비용. "가슴 공명대"만 별도로 붙잡아 LTAS의
         # 24밴드 평균화로 희석되는 저역 신호를 보강한다.
+        gen_low_t, tgt_low_t = None, None
         if low_band_weight > 0:
-            loss = loss + low_band_weight * low_band_loss_fn(gen_wav, current_target_ltas)
+            lb_loss, gen_low_t, tgt_low_t = low_band_loss_from_dist(gen_ltas, current_target_ltas)
+            loss = loss + low_band_weight * lb_loss
+        elif use_paired and paired_sampling_mode == "weighted" and gen_ltas is not None:
+            # [v16-NEW] low_band_weight=0(손실로는 안 씀)이어도 weighted 샘플링에
+            # 필요한 저역 오차 신호만 그래디언트 없이 계산해둔다.
+            with torch.no_grad():
+                gen_low_t = low_band_ratio(gen_ltas)
+                tgt_low_t = low_band_ratio(current_target_ltas)
 
         # [v5-NEW] 페어드 스텝의 duration 오차율 계산 (MSS 게이팅 + dur_loss 공용)
         dur_ratio_err = None
@@ -1058,6 +1197,16 @@ def main():
             # smoothed_dur_err = 지금까지 관측된 항목들 중 가장 안 풀린(최댓값) EMA
             # (진단/로그/플롯 표시용 — stalled 항목도 포함해 "전체 중 최악"을 보여줌).
             smoothed_dur_err = max(dur_err_ema_per_item.values())
+
+            # [v16-NEW] 저역(low-band) 비율 오차도 duration과 동일한 항목별 EMA로
+            # 추적. gen_low_t/tgt_low_t는 위 loss 계산 구간에서 low_band_weight>0
+            # 이거나 weighted 샘플링일 때만 채워진다 — 둘 다 아니면 None이라 스킵.
+            if gen_low_t is not None:
+                low_err_pp = abs((gen_low_t.detach() - tgt_low_t.detach()).item()) * 100.0
+                prev_lb = low_band_err_ema_per_item.get(pi)
+                low_band_err_ema_per_item[pi] = (low_err_pp if prev_lb is None
+                                                  else early_stop_ema_alpha * low_err_pp
+                                                       + (1 - early_stop_ema_alpha) * prev_lb)
 
             # [v14_2-FIX] v14 최초 버전은 위 smoothed_dur_err(전체 max, stalled 포함)를
             # best_dp 선정 기준으로 그대로 썼는데, item[1]처럼 영구 정체된 항목이 있으면
@@ -1183,10 +1332,17 @@ def main():
             # `re.search`로 부분 매치하므로, 뒤에 필드를 추가해도 기존 Cell 10
             # 파싱은 영향받지 않는다(검증: 아래 self-test 참고).
             dur_ema_str = (f"{smoothed_dur_err:.4f}" if smoothed_dur_err is not None else "N/A")
+            # [v16-NEW] EMA(dur_err)와 같은 방식으로 뒤에 덧붙인다(re.search 부분
+            # 매치라 기존 Cell 10 정규식엔 영향 없음). "가장 안 풀린 항목"의 저역
+            # EMA를 진단용으로 노출 — 이 값이 훈련 내내 특정 항목(예: item2)에서만
+            # 안 줄어드는지 실시간으로 확인 가능해진다.
+            low_ema_str = (f"{max(low_band_err_ema_per_item.values()):.2f}"
+                            if low_band_err_ema_per_item else "N/A")
             print(f"  Step {step+1}/{num_steps} | Loss(total): {loss.item():.4f} | "
                   f"Loss(L3): {primary_loss:.4f} | LR: {current_lr:.5f} | "
                   f"Best(L3): {best_loss:.4f} | EMA(L3): {ema_str} | "
-                  f"ttl_std: {ttl_std:.4f} | EMA(dur_err): {dur_ema_str}")
+                  f"ttl_std: {ttl_std:.4f} | EMA(dur_err): {dur_ema_str} | "
+                  f"EMA(low_err): {low_ema_str}")
             if ttl_std > 0.09 or ttl_std < 0.05:
                 print(f"    [주의] style_ttl std({ttl_std:.4f})가 정상 범위(0.06~0.08) 밖입니다. "
                       f"과적합/붕괴 가능성 — lr 또는 threshold 재검토 권장.")
@@ -1224,6 +1380,7 @@ def main():
                 "smoothed_l3": smoothed_l3,
                 "smoothed_dur_err": smoothed_dur_err,
                 "dur_err_ema_per_item": dur_err_ema_per_item,
+                "low_band_err_ema_per_item": low_band_err_ema_per_item,  # [v16-NEW]
                 "stalled_items": sorted(stalled_items),
                 "dur_err_stall_baseline": dur_err_stall_baseline,
                 "best_loss": best_loss,
@@ -1331,6 +1488,7 @@ def main():
         "smoothed_l3": smoothed_l3,
         "smoothed_dur_err": smoothed_dur_err,
         "dur_err_ema_per_item": dur_err_ema_per_item,
+        "low_band_err_ema_per_item": low_band_err_ema_per_item,  # [v16-NEW]
         "stalled_items": sorted(stalled_items),
         "dur_err_stall_baseline": dur_err_stall_baseline,
         "best_loss": best_loss,
@@ -1432,6 +1590,20 @@ def main():
         if mean_band_err > 5.0:
             print(f"  [참고] 저역 비율 오차가 5%p를 넘습니다. low_band_weight를 "
                   f"높여보거나(현재 {low_band_weight}), ltas_weight와의 균형을 재검토해보세요.")
+        # [v16-NEW] 학습 내내 관측된 항목별 저역 EMA(진단용, low_band_weight>0이거나
+        # paired_sampling_mode="weighted"일 때만 채워짐). duration의 "정체 판정"과
+        # 같은 취지로, 특정 항목만 학습 시작부터 끝까지 안 풀렸는지 한눈에 보여준다
+        # — 단, 이 값은 게이트/저장 시점 선택에는 관여하지 않는 순수 진단 정보다.
+        if low_band_err_ema_per_item:
+            worst_pi, worst_ema = max(low_band_err_ema_per_item.items(), key=lambda kv: kv[1])
+            print(f"  [진단] 학습 중 항목별 저역 오차 EMA(최종): "
+                  + ", ".join(f"[{p+1}] {v:.1f}%p"
+                              for p, v in sorted(low_band_err_ema_per_item.items())))
+            if worst_ema > 8.0:
+                print(f"  [참고] 항목[{worst_pi+1}]은 학습 내내 저역 오차 EMA가 가장 컸습니다"
+                      f"({worst_ema:.1f}%p). item[1]의 duration처럼 구조적 outlier일 가능성이 "
+                      f"있습니다 — low_band_weight를 더 올려도 안 줄어든다면(이미 0.1→0.12 "
+                      f"테스트에서 확인됨), 사후 EQ 보정 대상으로 검토해보세요.")
     print("-" * 60)
     if warmdown_mode and ema_drifted_above_threshold:
         print("▶ 최종 판정: [⚠️ 웜다운 진입했으나 종료 시점 EMA가 threshold 재초과 — "
@@ -1443,5 +1615,72 @@ def main():
     print("=" * 60)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# [v16-NEW] self-test — `python optimize_style.py --selftest`로 실행.
+# GPU/ONNX 모델/오디오 파이프라인을 전혀 쓰지 않고 select_paired_index()의
+# 샘플링 로직만 검증한다. "코드 수정 시 실행/시뮬레이션으로 검증" 원칙에 따라
+# 추가됨 — 단, 이 self-test가 통과해도 실제 학습 결과(음색/duration/저역 수렴)를
+# 보장하지 않는다. 그건 반드시 실제 학습 1회로 확인해야 한다.
+# ─────────────────────────────────────────────────────────────────────────────
+def _selftest_select_paired_index():
+    n_items = 5
+    N = 20000
+
+    # 1) uniform 모드는 순수 random.randrange와 통계적으로 동일해야 한다
+    #    (하위 호환 검증 — 기존 config로 돌리는 사람에게 아무 영향 없어야 함).
+    rng = random.Random(0)
+    counts = [0] * n_items
+    for _ in range(N):
+        pi = select_paired_index(n_items, {}, {}, set(), mode="uniform", rng=rng)
+        counts[pi] += 1
+    expected = N / n_items
+    max_dev = max(abs(c - expected) / expected for c in counts)
+    assert max_dev < 0.05, f"[FAIL] uniform 모드 분포 편차 과다: {counts}"
+    print(f"[PASS] uniform 모드 == 균등분포 (편차 {max_dev*100:.1f}%): {counts}")
+
+    # 2) coverage-first: EMA가 하나도 없는 초반엔 전 항목이 최소 1번씩 관측될
+    #    때까지 반드시 미관측 항목 중에서만 뽑혀야 한다 (weighted 계산이 빈 평균으로
+    #    왜곡되는 것 방지).
+    rng = random.Random(1)
+    dur_ema, low_ema = {}, {}
+    picked = []
+    for _ in range(n_items):
+        pi = select_paired_index(n_items, dur_ema, low_ema, set(), mode="weighted", rng=rng)
+        picked.append(pi)
+        dur_ema[pi], low_ema[pi] = 0.1, 1.0
+    assert sorted(picked) == list(range(n_items)), f"[FAIL] coverage-first 위반: {picked}"
+    print(f"[PASS] coverage-first: 초반 {n_items}스텝에 전 항목 1회씩 관측됨 {picked}")
+
+    # 3) welt14 실측 패턴 재현: item1(인덱스0)은 duration 정체(stalled),
+    #    item2(인덱스1)는 저역 오차가 4번의 학습 내내 가장 컸음(+11.9~+14.3%p).
+    dur_ema = {0: 0.427, 1: 0.119, 2: 0.139, 3: 0.058, 4: 0.142}
+    low_ema = {0: 7.0,   1: 13.6,  2: 5.1,   3: 1.7,   4: 4.3}
+    stalled = {0}
+    rng = random.Random(2)
+    counts = [0] * n_items
+    for _ in range(N):
+        pi = select_paired_index(n_items, dur_ema, low_ema, stalled,
+                                  mode="weighted", explore_ratio=0.2, rng=rng)
+        counts[pi] += 1
+    freqs = [c / N for c in counts]
+    print("[INFO] weighted 샘플링 빈도(welt14 실측 패턴 재현): "
+          + ", ".join(f"item{i+1}={f:.3f}" for i, f in enumerate(freqs)))
+    assert freqs[1] == max(freqs), \
+        f"[FAIL] 가장 안 풀린 비정체 항목(item2)이 최다 샘플링돼야 함: {freqs}"
+    assert 0 < freqs[0] < freqs[1], \
+        f"[FAIL] 정체 항목(item1)은 낮되 0은 아니어야 함: {freqs}"
+    assert freqs[3] > 0.02, \
+        f"[FAIL] explore_ratio가 최소 커버리지를 보장하지 못함(item4): {freqs}"
+    print("[PASS] weighted 샘플링이 welt14 실측 패턴에서 기대한 방향으로 동작함 "
+          "(item2 최다 샘플링, item1은 낮지만 0은 아님, explore_ratio로 전 항목 최소 커버 유지)")
+
+    print("\n[v16 self-test] 전부 통과. ※ 이 self-test는 샘플링 로직만 검증합니다 — "
+          "GPU/ONNX 모델/실제 오디오를 쓰는 전체 학습 결과(음색·duration·저역 수렴)는 "
+          "보장하지 않으며, 반드시 실제 학습 1회로 최종 확인해야 합니다.")
+
+
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        _selftest_select_paired_index()
+    else:
+        main()
