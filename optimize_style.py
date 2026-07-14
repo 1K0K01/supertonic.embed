@@ -1,9 +1,18 @@
 """
-optimize_style_v17.py
+optimize_style_v18.py
 ─────────────────────────────────────────────────────────────────────────────
 한국 남성 저음(bass) 특화 Supertonic3 스타일 최적화 코드
 
 신규/수정사항 (누적, 최신순):
+  [v18]   저역(low-band) 손실에 항목별 가중치(low_band_item_weights) 추가.
+          welt12~15 실험에서 특정 항목(예: item2)이 다른 항목과 저역 방향이
+          구조적으로 상충하며(item1의 duration 정체와 동일 패턴), weighted
+          샘플링으로 그 항목에 그래디언트를 더 줘도 오히려 그 항목 자신과
+          무관한 다른 항목까지 같이 악화되는 게 실측으로 확인됨(공유 style_ttl
+          벡터로는 만족 불가능한 상충). low_band_item_weights로 특정 항목의
+          저역 손실 기여도를 개별적으로 낮춰(0에 가깝게) 그 항목이 다른 항목들의
+          저역 매칭을 방해하는 간섭을 줄일 수 있는지 테스트 가능. 길이 불일치/
+          미설정 시 전부 1.0으로 폴백 — 기본값에서는 기존과 100% 동일 동작.
   [v17]   HF Xet CDN(us.gcp.cdn.hf.co) 특정 PoP 장애로 microsoft/wavlm-large,
           speechbrain/spkrec-ecapa-voxceleb 다운로드가 403(invalid key pair id)로
           막히는 사고가 실제로 있었음. load_wavlm()/load_ecapa()가 각각
@@ -803,6 +812,17 @@ def main():
     # ltas_weight보다 작게 시작하는 걸 권장(과하면 저역만 밀어붙이다 다른 대역
     # 밸런스가 깨질 수 있음). 기본 0.1, 0=끔.
     low_band_weight = cfg.get("low_band_weight", 0.1)
+    # [v18-NEW] welt12~15 4번의 실험(low_band_weight 0.1/0.12, dp_lr_ratio 0.045/0.06,
+    # paired_sampling_mode uniform/weighted) 전부에서 item2의 저역 오차가 단 한 번도
+    # +11.9%p 밑으로 내려간 적이 없고, weighted 샘플링으로 item2에 그래디언트를
+    # 더 줬을 땐 오히려 item2 자신(+17.9%p)과 무관한 item4(-10.0%p)까지 같이
+    # 악화됨 — 공유 style_ttl 벡터로는 만족 불가능한 상충(item1의 duration과 동일
+    # 패턴)으로 사실상 확정. low_band_item_weights로 특정 항목의 저역 손실
+    # 기여도를 개별적으로 낮추면(0에 가깝게), 그 항목이 다른 항목들의 저역 매칭을
+    # 방해하는 그래디언트 간섭을 줄일 수 있는지 테스트 가능. 길이는 페어드
+    # 항목 수와 같아야 하며, None(기본값)이면 전부 1.0(기존과 100% 동일 동작).
+    # 예: item2(인덱스1)만 죽이려면 [1.0, 0.1, 1.0, 1.0, 1.0].
+    low_band_item_weights = cfg.get("low_band_item_weights", None)
     seq_loss_weight = cfg.get("seq_loss_weight", 0.3)
     dur_loss_weight = cfg.get("dur_loss_weight", 0.3)
     paired_ratio    = cfg.get("paired_ratio", 0.7)
@@ -943,6 +963,22 @@ def main():
                 torch.tensor(ids_np,  dtype=torch.long).to(DEVICE),
                 torch.tensor(mask_np, dtype=torch.float32).to(DEVICE)
             ))
+
+    # [v18-NEW] low_band_item_weights 길이/값 검증. 길이가 안 맞거나 미설정이면
+    # 전부 1.0(기존과 100% 동일 동작)으로 폴백 — 조용히 틀린 인덱스로 적용되는
+    # 사고를 막기 위해 불일치 시 명확히 경고하고 폴백한다.
+    n_paired = len(paired_text_inputs)
+    if low_band_item_weights is not None:
+        if not paired_mode or len(low_band_item_weights) != n_paired:
+            print(f"[경고] low_band_item_weights 길이({len(low_band_item_weights)})가 "
+                  f"페어드 항목 수({n_paired})와 다르거나 페어드 모드가 아닙니다. "
+                  f"전부 1.0(기존 동작)으로 폴백합니다.")
+            low_band_item_weights = [1.0] * n_paired
+        else:
+            print(f"[알림] low_band_item_weights 적용됨: {low_band_item_weights} "
+                  f"(1.0=정상 반영, 0에 가까울수록 그 항목의 저역 손실 기여도를 낮춤)")
+    else:
+        low_band_item_weights = [1.0] * n_paired
 
     # ── Seed 고정 ────────────────────────────────────────────────────────────
     torch.manual_seed(seed)
@@ -1219,7 +1255,11 @@ def main():
         gen_low_t, tgt_low_t = None, None
         if low_band_weight > 0:
             lb_loss, gen_low_t, tgt_low_t = low_band_loss_from_dist(gen_ltas, current_target_ltas)
-            loss = loss + low_band_weight * lb_loss
+            # [v18-NEW] 페어드 스텝이면 항목별 저역 손실 가중치를 곱한다 — 구조적으로
+            # 다른 항목과 상충하는 항목(예: item2)의 그래디언트 간섭을 낮추기 위한
+            # opt-in 레버. unpaired 스텝(평균 타겟이라 항목 구분 자체가 없음)은 항상 1.0.
+            item_mult = low_band_item_weights[pi] if use_paired else 1.0
+            loss = loss + low_band_weight * item_mult * lb_loss
         elif use_paired and paired_sampling_mode == "weighted" and gen_ltas is not None:
             # [v16-NEW] low_band_weight=0(손실로는 안 씀)이어도 weighted 샘플링에
             # 필요한 저역 오차 신호만 그래디언트 없이 계산해둔다.
